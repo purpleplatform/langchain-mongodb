@@ -65,8 +65,10 @@ class MongoDBAtlasVectorSearch(VectorStore):
           not the self-managed MongoDB.
           Follow [this guide](https://www.mongodb.com/basics/mongodb-atlas-tutorial)
 
-        * Create a Collection and a Vector Search Index.The procedure is described
+        * Create a Collection and a Vector Search Index.  The procedure is described
           [here](https://www.mongodb.com/docs/atlas/atlas-vector-search/create-index/#procedure).
+          You can optionally supply a `dimensions` argument to programmatically create a Vector
+          Search Index.
 
         * Install ``langchain-mongodb``
 
@@ -203,6 +205,9 @@ class MongoDBAtlasVectorSearch(VectorStore):
         text_key: str = "text",
         embedding_key: str = "embedding",
         relevance_score_fn: str = "cosine",
+        dimensions: int = -1,
+        auto_create_index: bool = True,
+        auto_index_timeout: int = 15,
         **kwargs: Any,
     ):
         """
@@ -215,6 +220,10 @@ class MongoDBAtlasVectorSearch(VectorStore):
             vector_index_name: Name of the Atlas Vector Search index
             relevance_score_fn: The similarity score used for the index
                 Currently supported: 'euclidean', 'cosine', and 'dotProduct'
+            dimensions: Number of dimensions in embedding.  If the value is set and
+                the index does not exist, an index will be created.
+            auto_index_timeout: Timeout in seconds to wait for an auto-created index
+               to be ready.
         """
         self._collection = collection
         self._embedding = embedding
@@ -222,6 +231,21 @@ class MongoDBAtlasVectorSearch(VectorStore):
         self._text_key = text_key
         self._embedding_key = embedding_key
         self._relevance_score_fn = relevance_score_fn
+
+        if not auto_create_index or dimensions == -1:
+            return
+        coll = self._collection
+        if not any(
+            [ix["name"] == self._index_name for ix in coll.list_search_indexes()]
+        ):
+            create_vector_search_index(
+                collection=coll,
+                index_name=self._index_name,
+                dimensions=dimensions,
+                path=self._embedding_key,
+                similarity=self._relevance_score_fn,
+                wait_until_complete=auto_index_timeout,
+            )
 
     @property
     def embeddings(self) -> Embeddings:
