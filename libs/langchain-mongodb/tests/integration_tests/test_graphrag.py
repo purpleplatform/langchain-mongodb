@@ -1,4 +1,5 @@
 import os
+from typing import Generator
 
 import pytest
 from flaky import flaky
@@ -18,7 +19,7 @@ DB_NAME = "langchain_test_db"
 COLLECTION_NAME = "langchain_test_graphrag"
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def collection() -> Collection:
     client = MongoClient(MONGODB_URI)
     db = client[DB_NAME]
@@ -33,7 +34,7 @@ if "OPENAI_API_KEY" not in os.environ:
     )
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def entity_extraction_model() -> BaseChatModel:
     """LLM for converting documents into Graph of Entities and Relationships"""
     try:
@@ -42,7 +43,7 @@ def entity_extraction_model() -> BaseChatModel:
         pass
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def documents():
     return [
         Document(
@@ -76,7 +77,7 @@ The project is set to expand across multiple regions, marking a milestone in the
     ]
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def entity_example():
     return """
 Input:
@@ -115,8 +116,10 @@ Output:
 """
 
 
-@pytest.fixture(scope="module")
-def graph_store(collection, entity_extraction_model, documents) -> MongoDBGraphStore:
+@pytest.fixture
+def graph_store(
+    collection, entity_extraction_model, documents
+) -> Generator[None, None, MongoDBGraphStore]:
     store = MongoDBGraphStore(
         collection=collection,
         entity_extraction_model=entity_extraction_model,
@@ -126,10 +129,11 @@ def graph_store(collection, entity_extraction_model, documents) -> MongoDBGraphS
     bulkwrite_results = store.add_documents(documents)
     assert len(bulkwrite_results) == len(documents)
     assert isinstance(bulkwrite_results[0], BulkWriteResult)
-    return store
+    yield store
+    store.close()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def query_connection():
     return "How are Jane Smith and John Doe related?"
 
