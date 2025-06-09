@@ -6,17 +6,9 @@ from langchain_core.prompts.chat import (
 
 ENTITY_EXTRACTION_INSTRUCTIONS = """
 ## Overview
-You are a meticulous analyst tasked with extracting information from unstructured text
+You are a meticulous analyst tasked with identifying potential entities from unstructured text
 to build a knowledge graph in a structured json format of entities (nodes) and their relationships (edges).
-The graph will be stored in a MongoDB Collection and traversed using $graphLookup
-from starting points of entity nodes matching names found in a query, and follow their relationships.
-
-Use the following as guidelines.
-
-- Simplicity: The graph should have as few entities and relationship types as needed to convey the information in the input.
-- Consistency: Connections can only be made if entities and relationships use consistent naming.
-- Generality: The graph should be useful for describing the concepts in not just this document but other similar documents.
-- Accuracy: Do not add any information that is not explicitly mentioned in the text.
+**Include as many entities and relationships as you can.**
 
 INPUT: You will be provided a text document.
 OUTPUT:
@@ -84,21 +76,19 @@ Each object must conform to the following schema:
 
 
 NAME_EXTRACTION_INSTRUCTIONS = """
-You are a meticulous analyst tasked with extracting information from documents to form
-knowledge graphs of entities (nodes) and their relationships (edges).
-
-You will be provided a short document (query) from which you infer the entity names.
-You need not think about relationships between the entities. You only need names.
+You are an analyst tasked with identifying potential entities in text documents.
+You will be provided a short document from which you infer entity names.
+Identify as many as possible.
 
 Provide your response as a valid JSON Array of entity names
 or human-readable identifiers, found in the text.
 
 **Allowed Entity Types**:
-- Extract ONLY entities whose `type` matches one of the following: {allowed_entity_types}.
-- NOTE: If this list is empty, ANY `type` is permitted.
+- By default, all types are permitted.
+- If a non-empty list is provided, extract ONLY entities whose `type` matches one of the following: [{allowed_entity_types}].
 
 ### Examples of Exclusions:
-- If `allowed_entity_types` is `["Person", "Organization"]`, and the text mentions "Event" or "Location",
+- If `allowed_entity_types` is `["Person", "Organization"]`, and the text mentions an "Event" or "Location",
   these entities must **NOT** be included in the output.
 
  ## Examples:
