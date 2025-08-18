@@ -24,12 +24,7 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
 )
 
-from .utils import (
-    DRIVER_METADATA,
-    _append_client_metadata,
-    dumps_metadata,
-    loads_metadata,
-)
+from .utils import DRIVER_METADATA, dumps_metadata, loads_metadata
 
 if sys.version_info >= (3, 10):
     anext = builtins.anext
@@ -105,7 +100,8 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
         self.ttl = ttl
 
         # append_metadata was added in PyMongo 4.14.0, but is a valid database name on earlier versions
-        _append_client_metadata(self.client)
+        if callable(getattr(self.client, "append_metadata", None)):
+            self.client.append_metadata(DRIVER_METADATA)
 
     async def _setup(self) -> None:
         """Create indexes if not present."""
