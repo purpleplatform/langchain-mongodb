@@ -35,6 +35,9 @@ class MongoDBDocStore(BaseStore):
 
     def __init__(self, collection: Collection, text_key: str = "page_content") -> None:
         self.collection = collection
+        self.chunk_collection = self.collection.database[
+            f"{self.collection.name}_chunks"
+        ]
         self._text_key = text_key
 
         _append_client_metadata(self.collection.database.client)
@@ -81,10 +84,35 @@ class MongoDBDocStore(BaseStore):
         """
         found_docs = {}
         for res in self.collection.find({"_id": {"$in": keys}}):
-            text = res.pop(self._text_key)
             key = res.pop("_id")
-            make_serializable(res)
-            found_docs[key] = Document(page_content=text, metadata=res)
+            if not res.get("is_chunked"):
+                text = res.pop(self._text_key)
+                make_serializable(res)
+                found_docs[key] = Document(page_content=text, metadata=res)
+            else:
+                chunk_key = res.get("chunk_key")
+                num_chunks = res.get("num_chunks")
+                if not chunk_key or not num_chunks:
+                    continue
+
+                chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
+                chunk_docs_cursor = self.chunk_collection.find(
+                    {"_id": {"$in": chunk_keys}}
+                )
+                docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
+
+                if len(docs_by_id) != num_chunks:
+                    continue
+
+                from bson import BSON
+
+                reassembled_bytes = b"".join(docs_by_id[k] for k in chunk_keys)
+                reassembled_doc = BSON(reassembled_bytes).decode()
+                text = reassembled_doc.pop(self._text_key)
+                reassembled_doc.pop("_id", None)
+                make_serializable(reassembled_doc)
+                found_docs[key] = Document(page_content=text, metadata=reassembled_doc)
+
         return [found_docs.get(key, None) for key in keys]
 
     def mset(
@@ -148,7 +176,35 @@ class MongoDBDocStore(BaseStore):
         an error will be raised for that specific document. However, other documents
         in the batch that do not have conflicting _ids will still be inserted.
         """
-        to_insert = [
-            {"_id": i, self._text_key: t, **m} for i, t, m in zip(ids, texts, metadatas)
-        ]
-        self.collection.insert_many(to_insert)  # type: ignore
+        from bson import BSON, ObjectId
+
+        to_insert = []
+        chunk_size = 800 * 1024
+        for i, t, m in zip(ids, texts, metadatas):
+            doc = {"_id": i, self._text_key: t, **m}
+            serialized_doc = BSON.encode(doc)
+
+            if len(serialized_doc) <= chunk_size:
+                to_insert.append({"is_chunked": False, **doc})
+            else:
+                chunk_key = str(ObjectId())
+                chunks = [
+                    serialized_doc[j : j + chunk_size]
+                    for j in range(0, len(serialized_doc), chunk_size)
+                ]
+                chunk_docs = [
+                    {"_id": f"{chunk_key}_part_{j + 1}", "value": chunk}
+                    for j, chunk in enumerate(chunks)
+                ]
+                self.chunk_collection.insert_many(chunk_docs)
+
+                to_insert.append(
+                    {
+                        "_id": i,
+                        "is_chunked": True,
+                        "chunk_key": chunk_key,
+                        "num_chunks": len(chunks),
+                    }
+                )
+        if to_insert:
+            self.collection.insert_many(to_insert)

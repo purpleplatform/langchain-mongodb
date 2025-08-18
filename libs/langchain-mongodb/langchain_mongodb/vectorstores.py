@@ -229,6 +229,10 @@ class MongoDBAtlasVectorSearch(VectorStore):
                to be ready.
         """
         self._collection = collection
+        self._collection = collection
+        self.chunk_collection = self._collection.database[
+            f"{self._collection.name}_chunks"
+        ]
         self._embedding = embedding
         self._index_name = index_name
         self._text_key = text_key if isinstance(text_key, str) else text_key[0]
@@ -427,22 +431,52 @@ class MongoDBAtlasVectorSearch(VectorStore):
 
         See add_texts for additional details.
         """
+        from bson import BSON
+
         if not texts:
             return []
         # Compute embedding vectors
         embeddings = self._embedding.embed_documents(list(texts))
         if not ids:
             ids = [str(ObjectId()) for _ in range(len(list(texts)))]
-        docs = [
-            {
+
+        operations = []
+        chunk_size = 800 * 1024
+
+        for i, t, m, embedding in zip(ids, texts, metadatas, embeddings):
+            doc = {
                 "_id": str_to_oid(i),
                 self._text_key: t,
                 self._embedding_key: embedding,
                 **m,
             }
-            for i, t, m, embedding in zip(ids, texts, metadatas, embeddings)
-        ]
-        operations = [ReplaceOne({"_id": doc["_id"]}, doc, upsert=True) for doc in docs]
+            serialized_doc = BSON.encode(doc)
+
+            if len(serialized_doc) <= chunk_size:
+                operations.append(ReplaceOne({"_id": doc["_id"]}, doc, upsert=True))
+            else:
+                chunk_key = str(ObjectId())
+                chunks = [
+                    serialized_doc[j : j + chunk_size]
+                    for j in range(0, len(serialized_doc), chunk_size)
+                ]
+                chunk_docs = [
+                    {"_id": f"{chunk_key}_part_{j + 1}", "value": chunk}
+                    for j, chunk in enumerate(chunks)
+                ]
+                self.chunk_collection.insert_many(chunk_docs)
+
+                pointer_doc = {
+                    "_id": str_to_oid(i),
+                    "is_chunked": True,
+                    "chunk_key": chunk_key,
+                    "num_chunks": len(chunks),
+                    self._embedding_key: embedding,
+                }
+                operations.append(
+                    ReplaceOne({"_id": pointer_doc["_id"]}, pointer_doc, upsert=True)
+                )
+
         # insert the documents in MongoDB Atlas
         result = self._collection.bulk_write(operations)
         assert result.upserted_ids is not None
@@ -808,14 +842,43 @@ class MongoDBAtlasVectorSearch(VectorStore):
 
         # Format
         for res in cursor:
-            if self._text_key not in res:
-                continue
-            text = res.pop(self._text_key)
-            score = res.pop("score")
-            make_serializable(res)
-            docs.append(
-                (Document(page_content=text, metadata=res, id=res["_id"]), score)
-            )
+            if not res.get("is_chunked"):
+                if self._text_key not in res:
+                    continue
+                text = res.pop(self._text_key)
+                score = res.pop("score")
+                make_serializable(res)
+                docs.append(
+                    (Document(page_content=text, metadata=res, id=res["_id"]), score)
+                )
+            else:
+                chunk_key = res.get("chunk_key")
+                num_chunks = res.get("num_chunks")
+                if not chunk_key or not num_chunks:
+                    continue
+
+                chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
+                chunk_docs_cursor = self.chunk_collection.find(
+                    {"_id": {"$in": chunk_keys}}
+                )
+                docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
+
+                if len(docs_by_id) != num_chunks:
+                    continue
+
+                from bson import BSON
+
+                reassembled_bytes = b"".join(docs_by_id[key] for key in chunk_keys)
+                reassembled_doc = BSON(reassembled_bytes).decode()
+                text = reassembled_doc.pop(self._text_key)
+                reassembled_doc.pop("_id", None)
+                score = res.pop("score")
+                # Combine pointer metadata with reassembled metadata
+                res.update(reassembled_doc)
+                make_serializable(res)
+                docs.append(
+                    (Document(page_content=text, metadata=res, id=res["_id"]), score)
+                )
         return docs
 
     def create_vector_search_index(

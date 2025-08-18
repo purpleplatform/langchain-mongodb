@@ -126,6 +126,7 @@ class MongoDBChatMessageHistory(BaseChatMessageHistory):
 
         self.db = self.client[database_name]
         self.collection = self.db[collection_name]
+        self.chunk_collection = self.db[f"{collection_name}_chunks"]
 
         if create_index:
             index_kwargs = index_kwargs or {}
@@ -151,10 +152,31 @@ class MongoDBChatMessageHistory(BaseChatMessageHistory):
         except errors.OperationFailure as error:
             logger.error(error)
 
-        if cursor:
-            items = [json.loads(document[self.history_key]) for document in cursor]
-        else:
-            items = []
+        if not cursor:
+            return []
+
+        items = []
+        for document in cursor:
+            if not document.get("is_chunked"):
+                history = document[self.history_key]
+                items.append(json.loads(history))
+            else:
+                chunk_key = document.get("chunk_key")
+                num_chunks = document.get("num_chunks")
+                if not chunk_key or not num_chunks:
+                    continue
+
+                chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
+                chunk_docs_cursor = self.chunk_collection.find(
+                    {"_id": {"$in": chunk_keys}}
+                )
+                docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
+
+                if len(docs_by_id) != num_chunks:
+                    continue
+
+                reassembled = "".join(docs_by_id[key] for key in chunk_keys)
+                items.append(json.loads(reassembled))
 
         messages = messages_from_dict(items)
         return messages
@@ -165,13 +187,37 @@ class MongoDBChatMessageHistory(BaseChatMessageHistory):
 
     def add_message(self, message: BaseMessage) -> None:
         """Append the message to the record in MongoDB"""
+        from bson import ObjectId
+
+        history = json.dumps(message_to_dict(message))
+        chunk_size = 800 * 1024
+
+        if len(history.encode("utf-8")) <= chunk_size:
+            doc_to_insert = {
+                self.session_id_key: self.session_id,
+                self.history_key: history,
+                "is_chunked": False,
+            }
+        else:
+            chunk_key = str(ObjectId())
+            chunks = [
+                history[i : i + chunk_size] for i in range(0, len(history), chunk_size)
+            ]
+            chunk_docs = [
+                {"_id": f"{chunk_key}_part_{i + 1}", "value": chunk}
+                for i, chunk in enumerate(chunks)
+            ]
+            self.chunk_collection.insert_many(chunk_docs)
+
+            doc_to_insert = {
+                self.session_id_key: self.session_id,
+                "is_chunked": True,
+                "chunk_key": chunk_key,
+                "num_chunks": len(chunks),
+            }
+
         try:
-            self.collection.insert_one(
-                {
-                    self.session_id_key: self.session_id,
-                    self.history_key: json.dumps(message_to_dict(message)),
-                }
-            )
+            self.collection.insert_one(doc_to_insert)
         except errors.WriteError as err:
             logger.error(err)
 

@@ -160,6 +160,9 @@ class MongoDBStore(BaseStore):
         """
 
         self.collection = collection
+        self.chunk_collection = self.collection.database[
+            f"{self.collection.name}_chunks"
+        ]
         self.ttl_config = {} if ttl_config is None else ttl_config
         self.index_config = {} if index_config is None else index_config
         self._index_name = self.index_config.get("name", "vector_index")
@@ -297,8 +300,35 @@ class MongoDBStore(BaseStore):
                 return_document=ReturnDocument.AFTER,
             )
         if res:
+            if not res.get("is_chunked"):
+                return Item(
+                    value=res["value"],
+                    key=res["key"],
+                    namespace=tuple(res["namespace"]),
+                    created_at=res["created_at"],
+                    updated_at=res["updated_at"],
+                )
+
+            chunk_key = res.get("chunk_key")
+            num_chunks = res.get("num_chunks")
+            if not chunk_key or not num_chunks:
+                return None
+
+            chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
+            chunk_docs_cursor = self.chunk_collection.find(
+                {"_id": {"$in": chunk_keys}}
+            )
+            docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
+
+            if len(docs_by_id) != num_chunks:
+                return None
+
+            reassembled = b"".join(docs_by_id[key] for key in chunk_keys)
+            from bson import BSON
+
+            value = BSON(reassembled).decode()
             return Item(
-                value=res["value"],
+                value=value,
                 key=res["key"],
                 namespace=tuple(res["namespace"]),
                 created_at=res["created_at"],
@@ -480,6 +510,8 @@ class MongoDBStore(BaseStore):
                         offset=op.offset,
                     )
                 )
+        from bson import BSON, ObjectId
+
         # Apply puts and deletes in bulk
         # Extract texts to embed for each op
         if self.index_config:
@@ -494,12 +526,36 @@ class MongoDBStore(BaseStore):
                 )
             else:
                 # Add or Upsert the value
-                to_set = {
-                    "value": op.value,
-                    "updated_at": datetime.now(tz=timezone.utc),
-                }
+                serialized_val = BSON.encode(op.value)
+                chunk_size = 800 * 1024
+
+                if len(serialized_val) <= chunk_size:
+                    to_set = {
+                        "value": op.value,
+                        "updated_at": datetime.now(tz=timezone.utc),
+                        "is_chunked": False,
+                    }
+                else:
+                    chunk_key = str(ObjectId())
+                    chunks = [
+                        serialized_val[i : i + chunk_size]
+                        for i in range(0, len(serialized_val), chunk_size)
+                    ]
+                    chunk_docs = [
+                        {"_id": f"{chunk_key}_part_{i + 1}", "value": chunk}
+                        for i, chunk in enumerate(chunks)
+                    ]
+                    self.chunk_collection.insert_many(chunk_docs)
+                    to_set = {
+                        "updated_at": datetime.now(tz=timezone.utc),
+                        "is_chunked": True,
+                        "chunk_key": chunk_key,
+                        "num_chunks": len(chunks),
+                    }
+
                 if self.index_config:
-                    to_set[self._embedding_key] = vectors[v]
+                    if not to_set.get("is_chunked"):
+                        to_set[self._embedding_key] = vectors[v]
                     to_set["namespace_prefix"] = self._denormalize_path(op.namespace)
                     v += 1
 
@@ -633,17 +689,49 @@ class MongoDBStore(BaseStore):
 
         results = self.collection.aggregate(pipeline)
 
-        return [
-            SearchItem(
-                namespace=tuple(res["namespace"]),
-                key=res["key"],
-                value=res["value"],
-                created_at=res["created_at"],
-                updated_at=res["updated_at"],
-                score=res.get("score"),
-            )
-            for res in results
-        ]
+        items = []
+        for res in results:
+            if not res.get("is_chunked"):
+                items.append(
+                    SearchItem(
+                        namespace=tuple(res["namespace"]),
+                        key=res["key"],
+                        value=res["value"],
+                        created_at=res["created_at"],
+                        updated_at=res["updated_at"],
+                        score=res.get("score"),
+                    )
+                )
+            else:
+                chunk_key = res.get("chunk_key")
+                num_chunks = res.get("num_chunks")
+                if not chunk_key or not num_chunks:
+                    continue
+
+                chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
+                chunk_docs_cursor = self.chunk_collection.find(
+                    {"_id": {"$in": chunk_keys}}
+                )
+                docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
+
+                if len(docs_by_id) != num_chunks:
+                    continue
+
+                reassembled = b"".join(docs_by_id[key] for key in chunk_keys)
+                from bson import BSON
+
+                value = BSON(reassembled).decode()
+                items.append(
+                    SearchItem(
+                        namespace=tuple(res["namespace"]),
+                        key=res["key"],
+                        value=value,
+                        created_at=res["created_at"],
+                        updated_at=res["updated_at"],
+                        score=res.get("score"),
+                    )
+                )
+        return items
 
     def _denormalize_path(self, paths: Union[tuple[str, ...], list[str]]) -> list[str]:
         """Create list of path parents, for use in $vectorSearch filter.
