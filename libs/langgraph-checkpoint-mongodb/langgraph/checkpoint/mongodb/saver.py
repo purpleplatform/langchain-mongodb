@@ -495,7 +495,8 @@ class MongoDBSaver(BaseCheckpointSaver):
                     upsert=True,
                 )
             )
-        self.writes_collection.bulk_write(operations)
+        for i in range(0, len(operations), 1000):
+            self.writes_collection.bulk_write(operations[i : i + 1000])
 
     def delete_thread(
         self,
