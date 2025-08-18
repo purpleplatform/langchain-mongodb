@@ -99,10 +99,6 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
         self.loop = asyncio.get_running_loop()
         self.ttl = ttl
 
-        # append_metadata was added in PyMongo 4.14.0, but is a valid database name on earlier versions
-        if callable(getattr(self.client, "append_metadata", None)):
-            self.client.append_metadata(DRIVER_METADATA)
-
     async def _setup(self) -> None:
         """Create indexes if not present."""
         if self._setup_future is not None:
