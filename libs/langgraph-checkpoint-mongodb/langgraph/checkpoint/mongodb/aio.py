@@ -239,14 +239,32 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
 
             checkpoint = self.serde.loads_typed((doc["type"], serialized_checkpoint))
             serialized_writes = self.writes_collection.find(config_values)
-            pending_writes = [
-                (
-                    wrt["task_id"],
-                    wrt["channel"],
-                    self.serde.loads_typed((wrt["type"], wrt["value"])),
-                )
-                async for wrt in serialized_writes
-            ]
+            pending_writes = []
+            async for wrt in serialized_writes:
+                if not wrt.get("is_chunked"):
+                    value = self.serde.loads_typed((wrt["type"], wrt["value"]))
+                else:
+                    chunk_key = wrt.get("chunk_key")
+                    num_chunks = wrt.get("num_chunks")
+                    if not chunk_key or not num_chunks:
+                        continue
+
+                    chunk_keys = [
+                        f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)
+                    ]
+                    chunk_docs_cursor = self.chunk_collection.find(
+                        {"_id": {"$in": chunk_keys}}
+                    )
+                    docs_by_id = {
+                        doc["_id"]: doc["value"] async for doc in chunk_docs_cursor
+                    }
+
+                    if len(docs_by_id) != num_chunks:
+                        continue
+
+                    reassembled = b"".join(docs_by_id[key] for key in chunk_keys)
+                    value = self.serde.loads_typed((wrt["type"], reassembled))
+                pending_writes.append((wrt["task_id"], wrt["channel"], value))
             return CheckpointTuple(
                 {"configurable": config_values},
                 checkpoint,
@@ -313,14 +331,33 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
                 "checkpoint_id": doc["checkpoint_id"],
             }
             serialized_writes = self.writes_collection.find(config_values)
-            pending_writes = [
-                (
-                    wrt["task_id"],
-                    wrt["channel"],
-                    self.serde.loads_typed((wrt["type"], wrt["value"])),
-                )
-                async for wrt in serialized_writes
-            ]
+            pending_writes = []
+            async for wrt in serialized_writes:
+                if not wrt.get("is_chunked"):
+                    value = self.serde.loads_typed((wrt["type"], wrt["value"]))
+                else:
+                    chunk_key = wrt.get("chunk_key")
+                    num_chunks = wrt.get("num_chunks")
+                    if not chunk_key or not num_chunks:
+                        continue
+
+                    chunk_keys = [
+                        f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)
+                    ]
+                    chunk_docs_cursor = self.chunk_collection.find(
+                        {"_id": {"$in": chunk_keys}}
+                    )
+                    docs_by_id = {
+                        doc["_id"]: doc["value"] async for doc in chunk_docs_cursor
+                    }
+
+                    if len(docs_by_id) != num_chunks:
+                        continue
+
+                    reassembled = b"".join(docs_by_id[key] for key in chunk_keys)
+                    value = self.serde.loads_typed((wrt["type"], reassembled))
+
+                pending_writes.append((wrt["task_id"], wrt["channel"], value))
 
             yield CheckpointTuple(
                 config={
@@ -440,6 +477,8 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
             task_id (str): Identifier for the task creating the writes.
             task_path (str): Path of the task creating the writes.
         """
+        from bson import ObjectId
+
         await self._setup()
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"]["checkpoint_ns"]
@@ -448,6 +487,7 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
             "$set" if all(w[0] in WRITES_IDX_MAP for w in writes) else "$setOnInsert"
         )
         operations = []
+        chunk_size = 800 * 1024
         for idx, (channel, value) in enumerate(writes):
             upsert_query = {
                 "thread_id": thread_id,
@@ -460,16 +500,35 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
             if self.ttl:
                 upsert_query["created_at"] = datetime.now()
             type_, serialized_value = self.serde.dumps_typed(value)
+            if len(serialized_value) <= chunk_size:
+                doc = {
+                    "channel": channel,
+                    "type": type_,
+                    "value": serialized_value,
+                    "is_chunked": False,
+                }
+            else:
+                chunk_key = str(ObjectId())
+                chunks = [
+                    serialized_value[i : i + chunk_size]
+                    for i in range(0, len(serialized_value), chunk_size)
+                ]
+                chunk_docs = [
+                    {"_id": f"{chunk_key}_part_{i + 1}", "value": chunk}
+                    for i, chunk in enumerate(chunks)
+                ]
+                await self.chunk_collection.insert_many(chunk_docs)
+                doc = {
+                    "channel": channel,
+                    "type": type_,
+                    "is_chunked": True,
+                    "chunk_key": chunk_key,
+                    "num_chunks": len(chunks),
+                }
             operations.append(
                 UpdateOne(
                     upsert_query,
-                    {
-                        set_method: {
-                            "channel": channel,
-                            "type": type_,
-                            "value": serialized_value,
-                        }
-                    },
+                    {set_method: doc},
                     upsert=True,
                 )
             )
