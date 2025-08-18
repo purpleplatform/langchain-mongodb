@@ -473,7 +473,8 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
                     upsert=True,
                 )
             )
-        await self.writes_collection.bulk_write(operations)
+        for i in range(0, len(operations), 1000):
+            await self.writes_collection.bulk_write(operations[i : i + 1000])
 
     async def adelete_thread(
         self,
