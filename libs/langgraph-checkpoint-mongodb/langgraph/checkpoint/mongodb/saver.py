@@ -89,6 +89,7 @@ class MongoDBSaver(BaseCheckpointSaver):
         self.db = self.client[db_name]
         self.checkpoint_collection = self.db[checkpoint_collection_name]
         self.writes_collection = self.db[writes_collection_name]
+        self.chunk_collection = self.db[f"{checkpoint_collection_name}_chunks"]
         self.ttl = ttl
 
         # Create indexes if not present
@@ -224,7 +225,27 @@ class MongoDBSaver(BaseCheckpointSaver):
                 "checkpoint_ns": checkpoint_ns,
                 "checkpoint_id": doc["checkpoint_id"],
             }
-            checkpoint = self.serde.loads_typed((doc["type"], doc["checkpoint"]))
+            if not doc.get("is_chunked"):
+                serialized_checkpoint = doc["checkpoint"]
+            else:
+                chunk_key = doc.get("chunk_key")
+                num_chunks = doc.get("num_chunks")
+                if not chunk_key or not num_chunks:
+                    return None
+
+                chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
+                chunk_docs_cursor = self.chunk_collection.find(
+                    {"_id": {"$in": chunk_keys}}
+                )
+                docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
+
+                if len(docs_by_id) != num_chunks:
+                    return None
+
+                reassembled = b"".join(docs_by_id[key] for key in chunk_keys)
+                serialized_checkpoint = reassembled
+
+            checkpoint = self.serde.loads_typed((doc["type"], serialized_checkpoint))
             serialized_writes = self.writes_collection.find(config_values)
             pending_writes = [
                 (
@@ -372,16 +393,41 @@ class MongoDBSaver(BaseCheckpointSaver):
             >>> print(saved_config)
             {'configurable': {'thread_id': '1', 'checkpoint_ns': '', 'checkpoint_id': '1ef4f797-8335-6428-8001-8a1503f9b875'}}
         """
+        from bson import ObjectId
+
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"]["checkpoint_ns"]
         checkpoint_id = checkpoint["id"]
         type_, serialized_checkpoint = self.serde.dumps_typed(checkpoint)
-        doc = {
-            "parent_checkpoint_id": config["configurable"].get("checkpoint_id"),
-            "type": type_,
-            "checkpoint": serialized_checkpoint,
-            "metadata": dumps_metadata(metadata),
-        }
+
+        chunk_size = 800 * 1024
+        if len(serialized_checkpoint) <= chunk_size:
+            doc = {
+                "parent_checkpoint_id": config["configurable"].get("checkpoint_id"),
+                "type": type_,
+                "checkpoint": serialized_checkpoint,
+                "metadata": dumps_metadata(metadata),
+                "is_chunked": False,
+            }
+        else:
+            chunk_key = str(ObjectId())
+            chunks = [
+                serialized_checkpoint[i : i + chunk_size]
+                for i in range(0, len(serialized_checkpoint), chunk_size)
+            ]
+            chunk_docs = [
+                {"_id": f"{chunk_key}_part_{i + 1}", "value": chunk}
+                for i, chunk in enumerate(chunks)
+            ]
+            self.chunk_collection.insert_many(chunk_docs)
+            doc = {
+                "parent_checkpoint_id": config["configurable"].get("checkpoint_id"),
+                "type": type_,
+                "metadata": dumps_metadata(metadata),
+                "is_chunked": True,
+                "chunk_key": chunk_key,
+                "num_chunks": len(chunks),
+            }
         upsert_query = {
             "thread_id": thread_id,
             "checkpoint_ns": checkpoint_ns,

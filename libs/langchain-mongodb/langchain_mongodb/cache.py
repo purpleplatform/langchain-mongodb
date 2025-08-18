@@ -51,6 +51,7 @@ class MongoDBCache(BaseCache):
         self.client = _generate_mongo_client(connection_string)
         self.__database_name = database_name
         self.__collection_name = collection_name
+        self.chunk_collection = self.database[f"{self.__collection_name}_chunks"]
 
         if self.__collection_name not in self.database.list_collection_names():
             self.database.create_collection(self.__collection_name)
@@ -73,17 +74,69 @@ class MongoDBCache(BaseCache):
 
     def lookup(self, prompt: str, llm_string: str) -> Optional[RETURN_VAL_TYPE]:
         """Look up based on prompt and llm_string."""
-        return_doc = (
+        main_doc = (
             self.collection.find_one(self._generate_keys(prompt, llm_string)) or {}
         )
-        return_val = return_doc.get(self.RETURN_VAL)
-        return _loads_generations(return_val) if return_val else None  # type: ignore
+
+        if not main_doc:
+            return None
+
+        if not main_doc.get("is_chunked"):
+            return_val = main_doc.get(self.RETURN_VAL)
+            return _loads_generations(return_val) if return_val else None
+
+        chunk_key = main_doc.get("chunk_key")
+        num_chunks = main_doc.get("num_chunks")
+        if not chunk_key or not num_chunks:
+            return None
+
+        chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
+        chunk_docs_cursor = self.chunk_collection.find({"_id": {"$in": chunk_keys}})
+        docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
+
+        if len(docs_by_id) != num_chunks:
+            return None
+
+        reassembled = "".join(docs_by_id[key] for key in chunk_keys)
+        return _loads_generations(reassembled)  # type: ignore
 
     def update(self, prompt: str, llm_string: str, return_val: RETURN_VAL_TYPE) -> None:
         """Update cache based on prompt and llm_string."""
+        from bson import ObjectId
+
+        serialized_val = _dumps_generations(return_val)
+        chunk_size = 800 * 1024
+
+        keys = self._generate_keys(prompt, llm_string)
+
+        if len(serialized_val.encode("utf-8")) <= chunk_size:
+            self.collection.update_one(
+                keys,
+                {"$set": {self.RETURN_VAL: serialized_val, "is_chunked": False}},
+                upsert=True,
+            )
+            return
+
+        chunk_key = str(ObjectId())
+        chunks = [
+            serialized_val[i : i + chunk_size]
+            for i in range(0, len(serialized_val), chunk_size)
+        ]
+        chunk_docs = [
+            {"_id": f"{chunk_key}_part_{i + 1}", "value": chunk}
+            for i, chunk in enumerate(chunks)
+        ]
+        self.chunk_collection.insert_many(chunk_docs)
+
         self.collection.update_one(
-            {**self._generate_keys(prompt, llm_string)},
-            {"$set": {self.RETURN_VAL: _dumps_generations(return_val)}},
+            keys,
+            {
+                "$set": {
+                    "is_chunked": True,
+                    "chunk_key": chunk_key,
+                    "num_chunks": len(chunks),
+                }
+            },
             upsert=True,
         )
 
@@ -141,6 +194,9 @@ class MongoDBAtlasSemanticCache(BaseCache, MongoDBAtlasVectorSearch):
         """
         client = _generate_mongo_client(connection_string)
         self.collection = client[database_name][collection_name]
+        self.chunk_collection = self.collection.database[
+            f"{self.collection.name}_chunks"
+        ]
         self.score_threshold = score_threshold
         self._wait_until_ready = wait_until_ready
         super().__init__(
@@ -165,8 +221,28 @@ class MongoDBAtlasSemanticCache(BaseCache, MongoDBAtlasVectorSearch):
             post_filter_pipeline=post_filter_pipeline,
         )
         if search_response:
-            return_val = search_response[0][0].metadata.get(self.RETURN_VAL)
-            response = _loads_generations(return_val) or return_val  # type: ignore
+            metadata = search_response[0][0].metadata
+            if not metadata.get("is_chunked"):
+                return_val = metadata.get(self.RETURN_VAL)
+                response = _loads_generations(return_val) or return_val  # type: ignore
+                return response
+
+            chunk_key = metadata.get("chunk_key")
+            num_chunks = metadata.get("num_chunks")
+            if not chunk_key or not num_chunks:
+                return None
+
+            chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
+            chunk_docs_cursor = self.chunk_collection.find(
+                {"_id": {"$in": chunk_keys}}
+            )
+            docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
+
+            if len(docs_by_id) != num_chunks:
+                return None
+
+            reassembled = "".join(docs_by_id[key] for key in chunk_keys)
+            response = _loads_generations(reassembled) or reassembled  # type: ignore
             return response
         return None
 
@@ -178,15 +254,36 @@ class MongoDBAtlasSemanticCache(BaseCache, MongoDBAtlasVectorSearch):
         wait_until_ready: Optional[float] = None,
     ) -> None:
         """Update cache based on prompt and llm_string."""
-        self.add_texts(
-            [prompt],
-            [
-                {
-                    self.LLM: llm_string,
-                    self.RETURN_VAL: _dumps_generations(return_val),
-                }
-            ],
-        )
+        from bson import ObjectId
+
+        serialized_val = _dumps_generations(return_val)
+        chunk_size = 800 * 1024
+
+        if len(serialized_val.encode("utf-8")) <= chunk_size:
+            metadata = {
+                self.LLM: llm_string,
+                self.RETURN_VAL: serialized_val,
+                "is_chunked": False,
+            }
+        else:
+            chunk_key = str(ObjectId())
+            chunks = [
+                serialized_val[i : i + chunk_size]
+                for i in range(0, len(serialized_val), chunk_size)
+            ]
+            chunk_docs = [
+                {"_id": f"{chunk_key}_part_{i + 1}", "value": chunk}
+                for i, chunk in enumerate(chunks)
+            ]
+            self.chunk_collection.insert_many(chunk_docs)
+            metadata = {
+                self.LLM: llm_string,
+                "is_chunked": True,
+                "chunk_key": chunk_key,
+                "num_chunks": len(chunks),
+            }
+
+        self.add_texts([prompt], [metadata])
         wait = self._wait_until_ready if wait_until_ready is None else wait_until_ready
 
         def is_indexed() -> bool:
