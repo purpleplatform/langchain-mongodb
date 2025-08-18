@@ -6,6 +6,8 @@ Utilities for langchain-checkpoint-mongod.
 from importlib.metadata import version
 from typing import Any, Union
 
+from pymongo.driver_info import DriverInfo
+
 from langgraph.checkpoint.base import CheckpointMetadata
 from langgraph.checkpoint.serde.base import SerializerProtocol
 from pymongo import AsyncMongoClient

@@ -24,12 +24,7 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
 )
 
-from .utils import (
-    DRIVER_METADATA,
-    _append_client_metadata,
-    dumps_metadata,
-    loads_metadata,
-)
+from .utils import DRIVER_METADATA, dumps_metadata, loads_metadata
 
 if sys.version_info >= (3, 10):
     anext = builtins.anext
@@ -105,7 +100,8 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
         self.ttl = ttl
 
         # append_metadata was added in PyMongo 4.14.0, but is a valid database name on earlier versions
-        _append_client_metadata(self.client)
+        if callable(getattr(self.client, "append_metadata", None)):
+            self.client.append_metadata(DRIVER_METADATA)
 
     async def _setup(self) -> None:
         """Create indexes if not present."""
@@ -258,7 +254,7 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
             return CheckpointTuple(
                 {"configurable": config_values},
                 checkpoint,
-                loads_metadata(doc["metadata"]),
+                loads_metadata(self.serde, doc["metadata"]),
                 (
                     {
                         "configurable": {
@@ -305,7 +301,7 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
 
         if filter:
             for key, value in filter.items():
-                query[f"metadata.{key}"] = dumps_metadata(value)
+                query[f"metadata.{key}"] = dumps_metadata(self.serde, value)
 
         if before is not None:
             query["checkpoint_id"] = {"$lt": before["configurable"]["checkpoint_id"]}
@@ -339,7 +335,7 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
                     }
                 },
                 checkpoint=self.serde.loads_typed((doc["type"], doc["checkpoint"])),
-                metadata=loads_metadata(doc["metadata"]),
+                metadata=loads_metadata(self.serde, doc["metadata"]),
                 parent_config=(
                     {
                         "configurable": {
@@ -389,7 +385,7 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
                 "parent_checkpoint_id": config["configurable"].get("checkpoint_id"),
                 "type": type_,
                 "checkpoint": serialized_checkpoint,
-                "metadata": dumps_metadata(metadata),
+                "metadata": dumps_metadata(self.serde, metadata),
                 "is_chunked": False,
             }
         else:
@@ -406,7 +402,7 @@ class AsyncMongoDBSaver(BaseCheckpointSaver):
             doc = {
                 "parent_checkpoint_id": config["configurable"].get("checkpoint_id"),
                 "type": type_,
-                "metadata": dumps_metadata(metadata),
+                "metadata": dumps_metadata(self.serde, metadata),
                 "is_chunked": True,
                 "chunk_key": chunk_key,
                 "num_chunks": len(chunks),
