@@ -155,7 +155,7 @@ class MongoDBSaver(BaseCheckpointSaver):
                 conn_string,
                 driver=DRIVER_METADATA,
             )
-            yield MongoDBSaver(
+            yield cls(
                 client,
                 db_name,
                 checkpoint_collection_name,
