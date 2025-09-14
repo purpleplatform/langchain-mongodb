@@ -342,6 +342,26 @@ class MongoDBSaver(BaseCheckpointSaver):
         )
 
         for doc in result:
+            if not doc.get("is_chunked"):
+                serialized_checkpoint = doc["checkpoint"]
+            else:
+                chunk_key = doc.get("chunk_key")
+                num_chunks = doc.get("num_chunks")
+                if not chunk_key or not num_chunks:
+                    continue
+
+                chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
+                chunk_docs_cursor = self.chunk_collection.find(
+                    {"_id": {"$in": chunk_keys}}
+                )
+                docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
+
+                if len(docs_by_id) != num_chunks:
+                    continue
+
+                reassembled = b"".join(docs_by_id[key] for key in chunk_keys)
+                serialized_checkpoint = reassembled
+
             config_values = {
                 "thread_id": doc["thread_id"],
                 "checkpoint_ns": doc["checkpoint_ns"],
@@ -377,14 +397,8 @@ class MongoDBSaver(BaseCheckpointSaver):
                 pending_writes.append((wrt["task_id"], wrt["channel"], value))
 
             yield CheckpointTuple(
-                config={
-                    "configurable": {
-                        "thread_id": doc["thread_id"],
-                        "checkpoint_ns": doc["checkpoint_ns"],
-                        "checkpoint_id": doc["checkpoint_id"],
-                    }
-                },
-                checkpoint=self.serde.loads_typed((doc["type"], doc["checkpoint"])),
+                config={"configurable": config_values},
+                checkpoint=self.serde.loads_typed((doc["type"], serialized_checkpoint)),
                 metadata=loads_metadata(doc["metadata"]),
                 parent_config=(
                     {
