@@ -23,11 +23,11 @@ jobs:
       version: ${{ steps.check-version.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@d9e0f98d3fc6adb07d1e3d37f3043649ddad06a1 # v5
+        uses: astral-sh/setup-uv@681c641aba71e4a1c380be3ab5e12ad51f415867 # v5
         with:
           enable-cache: true
           python-version: ${{ env.PYTHON_VERSION }}
@@ -48,7 +48,7 @@ jobs:
         run: uv build
 
       - name: Upload build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-dist
           path: ${{ inputs.working-directory }}/dist/
@@ -74,16 +74,16 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           name: test-dist
           path: ${{ inputs.working-directory }}/dist/
 
       - name: Publish to test PyPI
-        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # release/v1
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # release/v1
         with:
           packages-dir: ${{ inputs.working-directory }}/dist/
           verbose: true
