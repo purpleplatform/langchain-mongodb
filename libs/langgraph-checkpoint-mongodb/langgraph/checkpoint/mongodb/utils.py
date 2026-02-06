@@ -35,6 +35,10 @@ def loads_metadata(
 
     metadata is stored in MongoDB collection with string keys and
     serde serialized keys.
+
+    Supports both:
+    - New format (v0.2.2+): tuple/list of (type, bytes), e.g., ("msgpack", b'...')
+    - Old format (<=v0.2.1): just bytes, e.g., b'"loop"' (assumes "json" type)
     """
     if isinstance(metadata, dict):
         output = dict()
@@ -42,7 +46,16 @@ def loads_metadata(
             output[key] = loads_metadata(serde, value)
         return output
     else:
-        return serde.loads_typed(metadata)
+        # Handle both old format (just bytes) and new format (tuple/list of type, bytes)
+        if isinstance(metadata, (tuple, list)) and len(metadata) == 2:
+            # New format: (type, bytes)
+            return serde.loads_typed(metadata)
+        elif isinstance(metadata, bytes):
+            # Old format: just bytes, assume "json" type for backward compatibility
+            return serde.loads_typed(("json", metadata))
+        else:
+            # Fallback: try as-is (may fail, but preserves original behavior)
+            return serde.loads_typed(metadata)
 
 
 def dumps_metadata(
