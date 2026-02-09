@@ -36,11 +36,11 @@ jobs:
       version: ${{ steps.check-version.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@d9e0f98d3fc6adb07d1e3d37f3043649ddad06a1 # v5
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v5
         with:
           enable-cache: true
           python-version: ${{ env.PYTHON_VERSION }}
@@ -61,7 +61,7 @@ jobs:
         run: uv build
 
       - name: Upload build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dist
           path: ${{ inputs.working-directory }}/dist/
@@ -93,7 +93,7 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       # We explicitly *don't* set up caching here. This ensures our tests are
@@ -110,7 +110,7 @@ jobs:
       #   used in the real world.
 
       - name: Install uv
-        uses: astral-sh/setup-uv@d9e0f98d3fc6adb07d1e3d37f3043649ddad06a1 # v5
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -206,24 +206,24 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@d9e0f98d3fc6adb07d1e3d37f3043649ddad06a1 # v5
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v5
         with:
           enable-cache: true
           python-version: ${{ env.PYTHON_VERSION }}
           cache-dependency-glob: "${{ inputs.working-directory }}/uv.lock"
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           name: dist
           path: ${{ inputs.working-directory }}/dist/
 
       - name: Publish package distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # release/v1
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # release/v1
         with:
           packages-dir: ${{ inputs.working-directory }}/dist/
           verbose: true
@@ -248,23 +248,23 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@d9e0f98d3fc6adb07d1e3d37f3043649ddad06a1 # v5
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v5
         with:
           enable-cache: true
           python-version: ${{ env.PYTHON_VERSION }}
           cache-dependency-glob: "${{ inputs.working-directory }}/uv.lock"
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           name: dist
           path: ${{ inputs.working-directory }}/dist/
 
       - name: Create Release
-        uses: ncipollo/release-action@bcfe5470707e8832e12347755757cec0eb3c22af # v1
+        uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1
         id: create-release
         with:
           artifacts: "${{ inputs.working-directory }}/dist/*"
