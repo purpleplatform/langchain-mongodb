@@ -32,24 +32,24 @@ jobs:
           - "3.9"
           - "3.13"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@d9e0f98d3fc6adb07d1e3d37f3043649ddad06a1 # v5
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v5
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
           cache-dependency-glob: "${{ inputs.working-directory }}/uv.lock"
 
-      - uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff # v3
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
 
       - name: Install dependencies
         working-directory: ${{ inputs.working-directory }}
         run: just install
 
       - name: Get .mypy_cache to speed up mypy
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         env:
           SEGMENT_DOWNLOAD_TIMEOUT_MIN: "2"
         with:
