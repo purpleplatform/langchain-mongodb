@@ -7,6 +7,13 @@ from langchain_core.stores import BaseStore
 from pymongo import MongoClient
 from pymongo.collection import Collection
 
+from langchain_mongodb.chunking import (
+    create_chunks,
+    delete_chunks_for_documents,
+    get_chunk_collection_name,
+    load_chunked_data,
+    should_chunk,
+)
 from langchain_mongodb.utils import (
     DRIVER_METADATA,
     _append_client_metadata,
@@ -36,6 +43,9 @@ class MongoDBDocStore(BaseStore):
     def __init__(self, collection: Collection, text_key: str = "page_content") -> None:
         self.collection = collection
         self._text_key = text_key
+        self.chunk_collection = collection.database[
+            get_chunk_collection_name(collection.name)
+        ]
 
         _append_client_metadata(self.collection.database.client)
 
@@ -81,10 +91,28 @@ class MongoDBDocStore(BaseStore):
         """
         found_docs = {}
         for res in self.collection.find({"_id": {"$in": keys}}):
-            text = res.pop(self._text_key)
-            key = res.pop("_id")
-            make_serializable(res)
-            found_docs[key] = Document(page_content=text, metadata=res)
+            if res.get("is_chunked"):
+                from bson import BSON
+
+                raw = load_chunked_data(
+                    res, self._text_key, self.chunk_collection, is_bytes=True
+                )
+                if raw:
+                    decoded = BSON(raw).decode()
+                    text = decoded.get(self._text_key, "")
+                    key = res["_id"]
+                    meta = {
+                        k: v
+                        for k, v in decoded.items()
+                        if k not in ("_id", self._text_key)
+                    }
+                    make_serializable(meta)
+                    found_docs[key] = Document(page_content=text, metadata=meta)
+            else:
+                text = res.pop(self._text_key)
+                key = res.pop("_id")
+                make_serializable(res)
+                found_docs[key] = Document(page_content=text, metadata=res)
         return [found_docs.get(key, None) for key in keys]
 
     def mset(
@@ -116,7 +144,10 @@ class MongoDBDocStore(BaseStore):
         Args:
             keys (Sequence[str]): A sequence of keys to delete.
         """
-        self.collection.delete_many({"_id": {"$in": keys}})
+        query = {"_id": {"$in": list(keys)}}
+        # Clean up chunks before deleting
+        delete_chunks_for_documents(self.collection, self.chunk_collection, query)
+        self.collection.delete_many(query)
 
     def yield_keys(
         self, *, prefix: Optional[str] = None
@@ -148,9 +179,22 @@ class MongoDBDocStore(BaseStore):
         If a document with the same _id already exists in the collection,
         an error will be raised for that specific document. However, other documents
         in the batch that do not have conflicting _ids will still be inserted.
+
+        Documents exceeding the MongoDB size limit are automatically chunked.
         """
-        to_insert = [
-            {"_id": i, self._text_key: t, **m}
-            for i, t, m in zip(ids, texts, metadatas, strict=True)
-        ]
-        self.collection.insert_many(to_insert)  # type: ignore
+        from bson import BSON
+
+        to_insert = []
+        for i, t, m in zip(ids, texts, metadatas, strict=True):
+            doc = {"_id": i, self._text_key: t, **m}
+            serialized = BSON.encode(doc)
+            if should_chunk(serialized):
+                chunk_meta = create_chunks(serialized, self.chunk_collection)
+                # Store pointer doc with chunking metadata
+                to_insert.append({"_id": i, **chunk_meta})
+            else:
+                doc["is_chunked"] = False
+                to_insert.append(doc)
+
+        if to_insert:
+            self.collection.insert_many(to_insert)  # type: ignore

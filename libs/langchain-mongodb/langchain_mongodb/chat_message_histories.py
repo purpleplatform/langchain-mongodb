@@ -10,6 +10,12 @@ from langchain_core.messages import (
 )
 from pymongo import MongoClient, errors
 
+from langchain_mongodb.chunking import (
+    create_chunks,
+    get_chunk_collection_name,
+    load_chunked_data,
+    should_chunk,
+)
 from langchain_mongodb.utils import DRIVER_METADATA, _append_client_metadata
 
 logger = logging.getLogger(__name__)
@@ -126,6 +132,7 @@ class MongoDBChatMessageHistory(BaseChatMessageHistory):
 
         self.db = self.client[database_name]
         self.collection = self.db[collection_name]
+        self.chunk_collection = self.db[get_chunk_collection_name(collection_name)]
 
         if create_index:
             index_kwargs = index_kwargs or {}
@@ -152,7 +159,19 @@ class MongoDBChatMessageHistory(BaseChatMessageHistory):
             logger.error(error)
 
         if cursor:
-            items = [json.loads(document[self.history_key]) for document in cursor]
+            items = []
+            for document in cursor:
+                if document.get("is_chunked"):
+                    history_str = load_chunked_data(
+                        document,
+                        self.history_key,
+                        self.chunk_collection,
+                        is_bytes=False,
+                    )
+                    if history_str:
+                        items.append(json.loads(history_str))
+                else:
+                    items.append(json.loads(document[self.history_key]))
         else:
             items = []
 
@@ -166,12 +185,18 @@ class MongoDBChatMessageHistory(BaseChatMessageHistory):
     def add_message(self, message: BaseMessage) -> None:
         """Append the message to the record in MongoDB"""
         try:
-            self.collection.insert_one(
-                {
-                    self.session_id_key: self.session_id,
-                    self.history_key: json.dumps(message_to_dict(message)),
-                }
-            )
+            serialized = json.dumps(message_to_dict(message))
+            doc: Dict = {self.session_id_key: self.session_id}
+
+            if should_chunk(serialized):
+                chunk_meta = create_chunks(serialized, self.chunk_collection)
+                doc.update(chunk_meta)
+                doc[self.history_key] = None
+            else:
+                doc[self.history_key] = serialized
+                doc["is_chunked"] = False
+
+            self.collection.insert_one(doc)
         except errors.WriteError as err:
             logger.error(err)
 

@@ -14,6 +14,12 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.database import Database
 
+from langchain_mongodb.chunking import (
+    create_chunks,
+    get_chunk_collection_name,
+    load_chunked_data,
+    should_chunk,
+)
 from langchain_mongodb.utils import DRIVER_METADATA
 from langchain_mongodb.vectorstores import MongoDBAtlasVectorSearch
 
@@ -51,6 +57,7 @@ class MongoDBCache(BaseCache):
         self.client = _generate_mongo_client(connection_string)
         self.__database_name = database_name
         self.__collection_name = collection_name
+        self.__chunk_collection_name = get_chunk_collection_name(collection_name)
 
         if self.__collection_name not in self.database.list_collection_names(
             authorizedCollections=True
@@ -69,6 +76,11 @@ class MongoDBCache(BaseCache):
         """Returns the collection used to store cache values."""
         return self.database[self.__collection_name]
 
+    @property
+    def chunk_collection(self) -> Collection:
+        """Returns the collection used to store chunked cache values."""
+        return self.database[self.__chunk_collection_name]
+
     def close(self) -> None:
         """Close the MongoClient used by the MongoDBCache."""
         self.client.close()
@@ -78,16 +90,41 @@ class MongoDBCache(BaseCache):
         return_doc = (
             self.collection.find_one(self._generate_keys(prompt, llm_string)) or {}
         )
-        return_val = return_doc.get(self.RETURN_VAL)
+        if return_doc.get("is_chunked"):
+            return_val = load_chunked_data(
+                return_doc, self.RETURN_VAL, self.chunk_collection, is_bytes=False
+            )
+        else:
+            return_val = return_doc.get(self.RETURN_VAL)
         return _loads_generations(return_val) if return_val else None  # type: ignore
 
     def update(self, prompt: str, llm_string: str, return_val: RETURN_VAL_TYPE) -> None:
         """Update cache based on prompt and llm_string."""
-        self.collection.update_one(
-            {**self._generate_keys(prompt, llm_string)},
-            {"$set": {self.RETURN_VAL: _dumps_generations(return_val)}},
-            upsert=True,
-        )
+        serialized = _dumps_generations(return_val)
+        query = {**self._generate_keys(prompt, llm_string)}
+
+        if should_chunk(serialized):
+            # Clean up old chunks if they exist
+            existing = self.collection.find_one(
+                query, {"is_chunked": 1, "chunk_key": 1}
+            )
+            if existing and existing.get("is_chunked") and existing.get("chunk_key"):
+                from langchain_mongodb.chunking import delete_chunks
+
+                delete_chunks(self.chunk_collection, existing["chunk_key"])
+
+            chunk_meta = create_chunks(serialized, self.chunk_collection)
+            self.collection.update_one(
+                query,
+                {"$set": {self.RETURN_VAL: None, **chunk_meta}},
+                upsert=True,
+            )
+        else:
+            self.collection.update_one(
+                query,
+                {"$set": {self.RETURN_VAL: serialized, "is_chunked": False}},
+                upsert=True,
+            )
 
     def _generate_keys(self, prompt: str, llm_string: str) -> Dict[str, str]:
         """Create keyed fields for caching layer"""
