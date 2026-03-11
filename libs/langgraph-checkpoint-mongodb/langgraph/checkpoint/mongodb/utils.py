@@ -39,6 +39,12 @@ def loads_metadata(
         for key, value in metadata.items():
             output[key] = loads_metadata(serde, value)
         return output
+    elif isinstance(metadata, (list, tuple)) and len(metadata) == 2:
+        # Standard serde typed format: (type_string, data_bytes)
+        return serde.loads_typed(metadata)
+    elif isinstance(metadata, bytes):
+        # Backward compatibility: old format stored plain bytes assuming JSON type
+        return serde.loads_typed(("json", metadata))
     else:
         return serde.loads_typed(metadata)
 
