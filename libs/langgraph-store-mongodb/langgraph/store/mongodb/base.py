@@ -41,6 +41,14 @@ from pymongo_search_utils import (
     vector_search_stage,
 )
 
+from langchain_mongodb.chunking import (
+    create_chunks,
+    delete_chunks,
+    get_chunk_collection_name,
+    load_chunked_data,
+    should_chunk,
+)
+
 from langgraph.store.mongodb.utils import DRIVER_METADATA
 
 logger = logging.getLogger(__name__)
@@ -224,6 +232,9 @@ class MongoDBStore(BaseStore):
         self._rerank_config: Optional[RerankConfig] = rerank_config or {}
 
         self.collection = collection
+        self.chunk_collection = collection.database[
+            get_chunk_collection_name(collection.name)
+        ]
         self.ttl_config = {} if ttl_config is None else ttl_config
         self.index_config = {} if index_config is None else index_config
         self.sep = kwargs.get("sep", "/")
@@ -425,8 +436,17 @@ class MongoDBStore(BaseStore):
                 return_document=ReturnDocument.AFTER,
             )
         if res:
+            if res.get("is_chunked"):
+                from bson import BSON
+
+                raw = load_chunked_data(
+                    res, "value", self.chunk_collection, is_bytes=True
+                )
+                value = BSON(raw).decode() if raw else res.get("value")
+            else:
+                value = res["value"]
             return Item(
-                value=res["value"],
+                value=value,
                 key=res["key"],
                 namespace=tuple(res["namespace"]),
                 created_at=res["created_at"],
@@ -441,9 +461,12 @@ class MongoDBStore(BaseStore):
             key: Unique identifier within the namespace.
         """
         self._validate_namespace(namespace)
-        self.collection.delete_one(
-            {"namespace_str": self.sep.join(namespace), "key": key}
-        )
+        query = {"namespace_str": self.sep.join(namespace), "key": key}
+        # Clean up chunks before deleting
+        existing = self.collection.find_one(query, {"is_chunked": 1, "chunk_key": 1})
+        if existing and existing.get("is_chunked") and existing.get("chunk_key"):
+            delete_chunks(self.chunk_collection, existing["chunk_key"])
+        self.collection.delete_one(query)
 
     def _validate_namespace(self, namespace: Sequence[str]) -> None:
         """Raise ValueError if any namespace part is empty or contains the separator."""
@@ -635,22 +658,50 @@ class MongoDBStore(BaseStore):
         for op in dedupped_putops.values():
             ns_str = self.sep.join(op.namespace)
             if op.value is None:
-                # mark the item for deletion.
-                writes.append(
-                    DeleteOne(
-                        filter={
-                            "namespace_str": ns_str,
-                            "key": op.key,
-                        }
-                    )
+                # Clean up chunks before deleting
+                op_filter = {"namespace_str": ns_str, "key": op.key}
+                existing = self.collection.find_one(
+                    op_filter, {"is_chunked": 1, "chunk_key": 1}
                 )
+                if (
+                    existing
+                    and existing.get("is_chunked")
+                    and existing.get("chunk_key")
+                ):
+                    delete_chunks(self.chunk_collection, existing["chunk_key"])
+                # mark the item for deletion.
+                writes.append(DeleteOne(filter=op_filter))
             else:
+                from bson import BSON
+
+                op_filter = {"namespace_str": ns_str, "key": op.key}
+
+                # Clean up old chunks if this item was previously chunked
+                existing = self.collection.find_one(
+                    op_filter, {"is_chunked": 1, "chunk_key": 1}
+                )
+                if (
+                    existing
+                    and existing.get("is_chunked")
+                    and existing.get("chunk_key")
+                ):
+                    delete_chunks(self.chunk_collection, existing["chunk_key"])
+
+                serialized = BSON.encode(op.value)
                 # Add or Upsert the value
-                to_set = {
+                to_set: dict[str, Any] = {
                     "namespace_str": ns_str,
-                    "value": op.value,
                     "updated_at": datetime.now(tz=timezone.utc),
                 }
+
+                if should_chunk(serialized):
+                    chunk_meta = create_chunks(serialized, self.chunk_collection)
+                    to_set.update(chunk_meta)
+                    to_set["value"] = None
+                else:
+                    to_set["value"] = op.value
+                    to_set["is_chunked"] = False
+
                 if self.index_config:
                     embed = texts[v] if self._is_autoembedding else vectors[v]
                     to_set[self._embedding_key] = embed
@@ -659,10 +710,7 @@ class MongoDBStore(BaseStore):
 
                 writes.append(
                     UpdateOne(
-                        filter={
-                            "namespace_str": ns_str,
-                            "key": op.key,
-                        },
+                        filter=op_filter,
                         update={
                             "$set": to_set,
                             "$setOnInsert": {
@@ -849,17 +897,28 @@ class MongoDBStore(BaseStore):
 
         results = self.collection.aggregate(pipeline)
 
-        return [
-            SearchItem(
-                namespace=tuple(res["namespace"]),
-                key=res["key"],
-                value=res["value"],
-                created_at=res["created_at"],
-                updated_at=res["updated_at"],
-                score=res.get("score"),
+        items = []
+        for res in results:
+            if res.get("is_chunked"):
+                from bson import BSON
+
+                raw = load_chunked_data(
+                    res, "value", self.chunk_collection, is_bytes=True
+                )
+                value = BSON(raw).decode() if raw else res.get("value")
+            else:
+                value = res["value"]
+            items.append(
+                SearchItem(
+                    namespace=tuple(res["namespace"]),
+                    key=res["key"],
+                    value=value,
+                    created_at=res["created_at"],
+                    updated_at=res["updated_at"],
+                    score=res.get("score"),
+                )
             )
-            for res in results
-        ]
+        return items
 
     def _denormalize_path(self, paths: Union[tuple[str, ...], list[str]]) -> list[str]:
         """Create list of path parents, for use in $vectorSearch filter.
