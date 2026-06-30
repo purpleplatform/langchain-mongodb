@@ -70,6 +70,10 @@ filterwarnings = [
     "ignore:unclosed <socket.socket:ResourceWarning",
     # Suppress pending deprecation from langchain-core loads() raised by upstream packages.
     "ignore::langchain_core._api.deprecation.LangChainPendingDeprecationWarning",
+    # langchain-community >=0.4.2 emits a "being sunset" DeprecationWarning at import;
+    # it is informational and the package still works. Ignore so the integration
+    # conftest (which imports langchain_community) does not fail under -W error.
+    "ignore:`langchain-community` is being sunset:DeprecationWarning",
 ]
 
 [tool.mypy]
