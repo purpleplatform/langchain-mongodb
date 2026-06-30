@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "langgraph-checkpoint>=3.0.0",
-    "langchain-mongodb>=0.8.0",
+    "langchain-mongodb>=0.11.0",
     "pymongo>=4.12,<4.18",
 ]
 
@@ -62,3 +62,9 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 allow_redefinition = true
 disable_error_code = "typeddict-item, return-value"
+
+[tool.uv.sources]
+# chunking support lives in the in-repo langchain-mongodb (first-party, not yet
+# published to PyPI), and saver.py/base.py import langchain_mongodb.chunking.
+# Consume the local editable package so standalone builds/tests resolve it.
+langchain-mongodb = { path = "../langchain-mongodb", editable = true }

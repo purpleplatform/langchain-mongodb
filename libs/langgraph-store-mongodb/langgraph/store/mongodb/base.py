@@ -7,6 +7,13 @@ from typing import Any, Literal, Optional, TypedDict, Union
 from bson import SON
 from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import run_in_executor
+from langchain_mongodb.chunking import (
+    create_chunks,
+    delete_chunks,
+    get_chunk_collection_name,
+    load_chunked_data,
+    should_chunk,
+)
 from langchain_mongodb.embeddings import AutoEmbeddings
 from langgraph.store.base import (
     BaseStore,
@@ -39,14 +46,6 @@ from pymongo_search_utils import (
     autoembedding_vector_search_stage,
     create_vector_search_index,
     vector_search_stage,
-)
-
-from langchain_mongodb.chunking import (
-    create_chunks,
-    delete_chunks,
-    get_chunk_collection_name,
-    load_chunked_data,
-    should_chunk,
 )
 
 from langgraph.store.mongodb.utils import DRIVER_METADATA

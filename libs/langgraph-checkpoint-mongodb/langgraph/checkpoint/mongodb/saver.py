@@ -5,9 +5,18 @@ from datetime import datetime, timezone
 from typing import (
     Any,
     Optional,
+    cast,
 )
 
 from langchain_core.runnables import RunnableConfig, run_in_executor
+from langchain_mongodb.chunking import (
+    create_chunks,
+    delete_chunks,
+    delete_chunks_for_documents,
+    get_chunk_collection_name,
+    load_chunked_data,
+    should_chunk,
+)
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
     BaseCheckpointSaver,
@@ -23,15 +32,6 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from pymongo import ASCENDING, MongoClient, UpdateOne
 from pymongo.collection import Collection
 from pymongo.database import Database as MongoDatabase
-
-from langchain_mongodb.chunking import (
-    create_chunks,
-    delete_chunks,
-    delete_chunks_for_documents,
-    get_chunk_collection_name,
-    load_chunked_data,
-    should_chunk,
-)
 
 from .utils import (
     DRIVER_METADATA,
@@ -280,7 +280,9 @@ class MongoDBSaver(BaseCheckpointSaver):
             checkpoint_data = load_chunked_data(
                 doc, "checkpoint", self.checkpoint_chunk_collection
             )
-            checkpoint = self.serde.loads_typed((doc["type"], checkpoint_data))
+            checkpoint = self.serde.loads_typed(
+                (doc["type"], cast(bytes, checkpoint_data))
+            )
             serialized_writes = self.writes_collection.find(config_values)
             pending_writes = []
             for wrt in serialized_writes:
@@ -291,7 +293,7 @@ class MongoDBSaver(BaseCheckpointSaver):
                     (
                         wrt["task_id"],
                         wrt["channel"],
-                        self.serde.loads_typed((wrt["type"], write_value)),
+                        self.serde.loads_typed((wrt["type"], cast(bytes, write_value))),
                     )
                 )
             return CheckpointTuple(
@@ -378,7 +380,7 @@ class MongoDBSaver(BaseCheckpointSaver):
                     (
                         wrt["task_id"],
                         wrt["channel"],
-                        self.serde.loads_typed((wrt["type"], write_value)),
+                        self.serde.loads_typed((wrt["type"], cast(bytes, write_value))),
                     )
                 )
 
@@ -393,7 +395,9 @@ class MongoDBSaver(BaseCheckpointSaver):
                         "checkpoint_id": doc["checkpoint_id"],
                     }
                 },
-                checkpoint=self.serde.loads_typed((doc["type"], checkpoint_data)),
+                checkpoint=self.serde.loads_typed(
+                    (doc["type"], cast(bytes, checkpoint_data))
+                ),
                 metadata=loads_metadata(self.serde, doc["metadata"]),
                 parent_config=(
                     {

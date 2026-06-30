@@ -54,3 +54,8 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 allow_redefinition = true
 disable_error_code = "typeddict-item, return-value"
+[tool.uv.sources]
+# chunking support lives in the in-repo langchain-mongodb (first-party, not yet
+# published to PyPI), and saver.py/base.py import langchain_mongodb.chunking.
+# Consume the local editable package so standalone builds/tests resolve it.
+langchain-mongodb = { path = "../langchain-mongodb", editable = true }

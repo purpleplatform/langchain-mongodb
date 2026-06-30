@@ -9,7 +9,7 @@ unique ObjectId string and N is 1-indexed.
 """
 
 import logging
-from typing import Any, Optional, Union
+from typing import Any, Literal, Optional, Union, overload
 
 from bson import ObjectId
 from pymongo.collection import Collection
@@ -80,6 +80,24 @@ def create_chunks(
     }
 
 
+@overload
+def load_chunked_data(
+    doc: dict[str, Any],
+    data_field: str,
+    chunk_collection: Collection,
+    is_bytes: Literal[True] = ...,
+) -> Optional[bytes]: ...
+
+
+@overload
+def load_chunked_data(
+    doc: dict[str, Any],
+    data_field: str,
+    chunk_collection: Collection,
+    is_bytes: Literal[False],
+) -> Optional[str]: ...
+
+
 def load_chunked_data(
     doc: dict[str, Any],
     data_field: str,
@@ -133,9 +151,7 @@ def load_chunked_data(
 def delete_chunks(chunk_collection: Collection, chunk_key: str) -> None:
     """Delete all chunk documents for a given chunk_key."""
     # chunk IDs follow the pattern "{chunk_key}_part_{N}"
-    chunk_collection.delete_many(
-        {"_id": {"$regex": f"^{chunk_key}_part_"}}
-    )
+    chunk_collection.delete_many({"_id": {"$regex": f"^{chunk_key}_part_"}})
 
 
 def delete_chunks_for_documents(
