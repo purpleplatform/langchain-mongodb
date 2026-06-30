@@ -53,6 +53,7 @@ def create_chunks(
     """
     chunk_key = str(ObjectId())
 
+    chunks: list[Union[bytes, str]]
     if isinstance(data, str):
         encoded = data.encode("utf-8")
         raw_chunks = [

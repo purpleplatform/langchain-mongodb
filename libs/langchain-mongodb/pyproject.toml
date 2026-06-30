@@ -92,3 +92,11 @@ lint.ignore = ["E501", "B008", "UP007", "UP006", "UP035", "UP045"]
 
 [tool.coverage.run]
 omit = ["tests/*"]
+
+[tool.uv]
+# The CI "minimum dependency versions" step (uv sync --resolution=lowest-direct)
+# otherwise pins numpy==1.26.0, which ships no cp313 wheel and fails to build from
+# source on the runner. Floor numpy to the first release with cp310-cp313 wheels.
+constraint-dependencies = [
+    "numpy>=2.1.0",
+]
