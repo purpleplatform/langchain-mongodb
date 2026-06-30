@@ -5,56 +5,80 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-mongodb"
-version = "0.6.2"
+version = "0.11.0"
 description = "An integration package connecting MongoDB and LangChain"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
-    "langchain-core>=0.3",
-    "langchain>=0.3",
+    "langchain-core>=1.2.5",
+    "langchain>=1.0",
+    "langchain-classic>=1.0",
     "pymongo>=4.6.1",
-    "langchain-text-splitters>=0.3",
+    "langchain-text-splitters>=1.0",
     "numpy>=1.26",
     "lark<2.0.0,>=1.1.9",
+    "pymongo-search-utils>=0.3.0",
 ]
 
 [dependency-groups]
 dev = [
     "freezegun>=1.2.2",
-    "langchain>=0.3.14",
-    "langchain-core>=0.3.29",
-    "langchain-text-splitters>=0.3.5",
+    "langchain>=1.0",
+    "langchain-core>=1.2.5",
+    "langchain-text-splitters>=1.0",
     "pytest-mock>=3.10.0",
     "pytest>=7.3.0",
     "syrupy>=4.0.2",
     "pytest-watcher>=0.3.4",
     "pytest-asyncio>=0.21.1",
-    "mongomock>=4.2.0.post1",
     "pre-commit>=4.0",
     "mypy>=1.10",
     "simsimd>=6.5.0",
-    "langchain-ollama>=0.2.2",
-    "langchain-openai>=0.2.14",
+    "langchain-ollama>=1.0",
+    "langchain-openai>=1.0",
     "langchain-community>=0.3.27",
     "pypdf>=5.0.1",
-    "langgraph>=0.2.72",
+    "langgraph>=1.0.0",
     "flaky>=3.8.1",
-    "langchain-tests==0.3.20",
+    "langchain-tests==1.1.9",
     "pip>=25.0.1",
     "typing-extensions>=4.12.2",
 ]
 
+[project.optional-dependencies]
+viz = [
+    "networkx>=3.0",
+    "holoviews>=1.19",
+]
+
 [tool.pytest.ini_options]
+minversion = "7"
 addopts = "--snapshot-warn-unused --strict-markers --strict-config --durations=5"
+log_cli_level = "INFO"
+faulthandler_timeout = 1500
+xfail_strict = true
 markers = [
     "requires: mark tests as requiring a specific library",
     "compile: mark placeholder test used to compile integration tests without running them",
+    "viz: marks tests as requiring optional-dependency group `viz`",
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "error",
+    # Ignore ResourceWarning raised by langchain standardized base classes.
+    "ignore:unclosed <socket.socket:ResourceWarning",
+    # Suppress pending deprecation from langchain-core loads() raised by upstream packages.
+    "ignore::langchain_core._api.deprecation.LangChainPendingDeprecationWarning",
+    # langchain-community >=0.4.2 emits a "being sunset" DeprecationWarning at import;
+    # it is informational and the package still works. Ignore so the integration
+    # conftest (which imports langchain_community) does not fail under -W error.
+    "ignore:`langchain-community` is being sunset:DeprecationWarning",
+]
 
 [tool.mypy]
 disallow_untyped_defs = true
+disable_error_code = ["import-untyped"]
 
 [[tool.mypy.overrides]]
 module = ["tests.*"]
@@ -68,7 +92,15 @@ lint.select = [
   "B",  # flake8-bugbear
   "I",  # isort
 ]
-lint.ignore = ["E501", "B008", "UP007", "UP006", "UP035"]
+lint.ignore = ["E501", "B008", "UP007", "UP006", "UP035", "UP045"]
 
 [tool.coverage.run]
 omit = ["tests/*"]
+
+[tool.uv]
+# The CI "minimum dependency versions" step (uv sync --resolution=lowest-direct)
+# otherwise pins numpy==1.26.0, which ships no cp313 wheel and fails to build from
+# source on the runner. Floor numpy to the first release with cp310-cp313 wheels.
+constraint-dependencies = [
+    "numpy>=2.1.0",
+]

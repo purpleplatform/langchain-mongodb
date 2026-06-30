@@ -7,6 +7,13 @@ from langchain_core.stores import BaseStore
 from pymongo import MongoClient
 from pymongo.collection import Collection
 
+from langchain_mongodb.chunking import (
+    create_chunks,
+    delete_chunks_for_documents,
+    get_chunk_collection_name,
+    load_chunked_data,
+    should_chunk,
+)
 from langchain_mongodb.utils import (
     DRIVER_METADATA,
     _append_client_metadata,
@@ -35,10 +42,10 @@ class MongoDBDocStore(BaseStore):
 
     def __init__(self, collection: Collection, text_key: str = "page_content") -> None:
         self.collection = collection
-        self.chunk_collection = self.collection.database[
-            f"{self.collection.name}_chunks"
-        ]
         self._text_key = text_key
+        self.chunk_collection = collection.database[
+            get_chunk_collection_name(collection.name)
+        ]
 
         _append_client_metadata(self.collection.database.client)
 
@@ -84,35 +91,28 @@ class MongoDBDocStore(BaseStore):
         """
         found_docs = {}
         for res in self.collection.find({"_id": {"$in": keys}}):
-            key = res.pop("_id")
-            if not res.get("is_chunked"):
-                text = res.pop(self._text_key)
-                make_serializable(res)
-                found_docs[key] = Document(page_content=text, metadata=res)
-            else:
-                chunk_key = res.get("chunk_key")
-                num_chunks = res.get("num_chunks")
-                if not chunk_key or not num_chunks:
-                    continue
-
-                chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
-                chunk_docs_cursor = self.chunk_collection.find(
-                    {"_id": {"$in": chunk_keys}}
-                )
-                docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
-
-                if len(docs_by_id) != num_chunks:
-                    continue
-
+            if res.get("is_chunked"):
                 from bson import BSON
 
-                reassembled_bytes = b"".join(docs_by_id[k] for k in chunk_keys)
-                reassembled_doc = BSON(reassembled_bytes).decode()
-                text = reassembled_doc.pop(self._text_key)
-                reassembled_doc.pop("_id", None)
-                make_serializable(reassembled_doc)
-                found_docs[key] = Document(page_content=text, metadata=reassembled_doc)
-
+                raw = load_chunked_data(
+                    res, self._text_key, self.chunk_collection, is_bytes=True
+                )
+                if raw:
+                    decoded = BSON(raw).decode()
+                    text = decoded.get(self._text_key, "")
+                    key = res["_id"]
+                    meta = {
+                        k: v
+                        for k, v in decoded.items()
+                        if k not in ("_id", self._text_key)
+                    }
+                    make_serializable(meta)
+                    found_docs[key] = Document(page_content=text, metadata=meta)
+            else:
+                text = res.pop(self._text_key)
+                key = res.pop("_id")
+                make_serializable(res)
+                found_docs[key] = Document(page_content=text, metadata=res)
         return [found_docs.get(key, None) for key in keys]
 
     def mset(
@@ -127,12 +127,13 @@ class MongoDBDocStore(BaseStore):
             batch_size: Number of documents to insert at a time.
                 Tuning this may help with performance and sidestep MongoDB limits.
         """
-        keys, docs = zip(*key_value_pairs)
+        keys, docs = zip(*key_value_pairs, strict=True)
         n_docs = len(docs)
         start = 0
         for end in range(batch_size, n_docs + batch_size, batch_size):
             texts, metadatas = zip(
-                *[(doc.page_content, doc.metadata) for doc in docs[start:end]]
+                *[(doc.page_content, doc.metadata) for doc in docs[start:end]],
+                strict=True,
             )
             self.insert_many(texts=texts, metadatas=metadatas, ids=keys[start:end])  # type: ignore
             start = end
@@ -143,7 +144,10 @@ class MongoDBDocStore(BaseStore):
         Args:
             keys (Sequence[str]): A sequence of keys to delete.
         """
-        self.collection.delete_many({"_id": {"$in": keys}})
+        query = {"_id": {"$in": list(keys)}}
+        # Clean up chunks before deleting
+        delete_chunks_for_documents(self.collection, self.chunk_collection, query)
+        self.collection.delete_many(query)
 
     def yield_keys(
         self, *, prefix: Optional[str] = None
@@ -175,36 +179,22 @@ class MongoDBDocStore(BaseStore):
         If a document with the same _id already exists in the collection,
         an error will be raised for that specific document. However, other documents
         in the batch that do not have conflicting _ids will still be inserted.
+
+        Documents exceeding the MongoDB size limit are automatically chunked.
         """
-        from bson import BSON, ObjectId
+        from bson import BSON
 
         to_insert = []
-        chunk_size = 800 * 1024
-        for i, t, m in zip(ids, texts, metadatas):
+        for i, t, m in zip(ids, texts, metadatas, strict=True):
             doc = {"_id": i, self._text_key: t, **m}
-            serialized_doc = BSON.encode(doc)
-
-            if len(serialized_doc) <= chunk_size:
-                to_insert.append({"is_chunked": False, **doc})
+            serialized = BSON.encode(doc)
+            if should_chunk(serialized):
+                chunk_meta = create_chunks(serialized, self.chunk_collection)
+                # Store pointer doc with chunking metadata
+                to_insert.append({"_id": i, **chunk_meta})
             else:
-                chunk_key = str(ObjectId())
-                chunks = [
-                    serialized_doc[j : j + chunk_size]
-                    for j in range(0, len(serialized_doc), chunk_size)
-                ]
-                chunk_docs = [
-                    {"_id": f"{chunk_key}_part_{j + 1}", "value": chunk}
-                    for j, chunk in enumerate(chunks)
-                ]
-                self.chunk_collection.insert_many(chunk_docs)
+                doc["is_chunked"] = False
+                to_insert.append(doc)
 
-                to_insert.append(
-                    {
-                        "_id": i,
-                        "is_chunked": True,
-                        "chunk_key": chunk_key,
-                        "num_chunks": len(chunks),
-                    }
-                )
         if to_insert:
-            self.collection.insert_many(to_insert)
+            self.collection.insert_many(to_insert)  # type: ignore

@@ -6,20 +6,25 @@ Utilities for langchain-checkpoint-mongod.
 from importlib.metadata import version
 from typing import Any, Union
 
-from pymongo.driver_info import DriverInfo
-
 from langgraph.checkpoint.base import CheckpointMetadata
 from langgraph.checkpoint.serde.base import SerializerProtocol
-from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-
-serde: SerializerProtocol = JsonPlusSerializer()
+from pymongo import AsyncMongoClient
+from pymongo.driver_info import DriverInfo
 
 DRIVER_METADATA = DriverInfo(
     name="Langgraph", version=version("langgraph-checkpoint-mongodb")
 )
 
 
-def loads_metadata(metadata: dict[str, Any]) -> CheckpointMetadata:
+def _append_client_metadata(client: AsyncMongoClient) -> None:
+    # append_metadata was added in PyMongo 4.14.0, but is a valid database name on earlier versions
+    if callable(client.append_metadata):
+        client.append_metadata(DRIVER_METADATA)
+
+
+def loads_metadata(
+    serde: SerializerProtocol, metadata: dict[str, Any]
+) -> CheckpointMetadata:
     """Deserialize metadata document
 
     The CheckpointMetadata class itself cannot be stored directly in MongoDB,
@@ -32,13 +37,30 @@ def loads_metadata(metadata: dict[str, Any]) -> CheckpointMetadata:
     if isinstance(metadata, dict):
         output = dict()
         for key, value in metadata.items():
-            output[key] = loads_metadata(value)
+            output[key] = loads_metadata(serde, value)
         return output
+    elif isinstance(metadata, (list, tuple)) and len(metadata) == 2:
+        # Standard serde typed format: (type_string, data_bytes)
+        return serde.loads_typed(metadata)
+    elif isinstance(metadata, bytes):
+        # Backward compatibility: old format stored plain bytes assuming JSON type
+        return serde.loads_typed(("json", metadata))
     else:
-        return serde.loads(metadata)
+        return serde.loads_typed(metadata)
+
+
+def _validate_filter(filter_dict: dict[str, Any]) -> None:
+    for key, value in filter_dict.items():
+        if not isinstance(key, str) or key.startswith("$"):
+            raise ValueError(
+                f"Invalid filter key '{key}': MongoDB operator keys are not allowed."
+            )
+        if isinstance(value, dict):
+            _validate_filter(value)
 
 
 def dumps_metadata(
+    serde: SerializerProtocol,
     metadata: Union[CheckpointMetadata, Any],
 ) -> Union[bytes, dict[str, Any]]:
     """Serialize all values in metadata dictionary.
@@ -48,7 +70,7 @@ def dumps_metadata(
     if isinstance(metadata, dict):
         output = dict()
         for key, value in metadata.items():
-            output[key] = dumps_metadata(value)
+            output[key] = dumps_metadata(serde, value)
         return output
     else:
-        return serde.dumps(metadata)
+        return serde.dumps_typed(metadata)

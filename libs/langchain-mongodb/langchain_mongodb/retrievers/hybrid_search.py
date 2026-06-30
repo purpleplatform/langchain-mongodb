@@ -1,4 +1,5 @@
-from typing import Annotated, Any, Dict, List, Optional
+import warnings
+from typing import Annotated, Any, Dict, List, Optional, Union
 
 from langchain_core.callbacks.manager import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
@@ -7,14 +8,17 @@ from pydantic import Field
 from pymongo.collection import Collection
 
 from langchain_mongodb import MongoDBAtlasVectorSearch
+from langchain_mongodb.index import create_fulltext_search_index
 from langchain_mongodb.pipelines import (
+    autoembedding_vector_search_stage,
     combine_pipelines,
     final_hybrid_stage,
     reciprocal_rank_stage,
+    rerank_stage,
     text_search_stage,
     vector_search_stage,
 )
-from langchain_mongodb.utils import make_serializable
+from langchain_mongodb.utils import make_serializable, prepare_query_for_vector_search
 
 
 class MongoDBAtlasHybridSearchRetriever(BaseRetriever):
@@ -49,10 +53,90 @@ class MongoDBAtlasHybridSearchRetriever(BaseRetriever):
     """Weight applied to full-text search results in RRF: score = weight * (1 / (rank + penalty + 1))"""
     show_embeddings: float = False
     """If true, returned Document metadata will include vectors."""
+    rerank_path: Optional[Union[str, List[str]]] = None
+    """Field or list of fields to rerank on. Enables $rerank when set."""
+    rerank_model: Optional[str] = None
+    """Voyage AI reranking model (e.g. 'rerank-2.5'). Uses latest model if omitted."""
+    num_docs_to_rerank: Optional[int] = None
+    """Candidates passed to the reranker. Defaults to k. Max 1000."""
     top_k: Annotated[
         Optional[int], Field(deprecated='top_k is deprecated, use "k" instead')
     ] = None
     """Number of documents to return."""
+
+    def __init__(
+        self,
+        *,
+        vectorstore: MongoDBAtlasVectorSearch,
+        search_index_name: str,
+        k: int = 4,
+        oversampling_factor: int = 10,
+        pre_filter: Optional[Dict[str, Any]] = None,
+        post_filter: Optional[List[Dict[str, Any]]] = None,
+        vector_penalty: float = 60.0,
+        fulltext_penalty: float = 60.0,
+        vector_weight: float = 1.0,
+        fulltext_weight: float = 1.0,
+        show_embeddings: float = False,
+        rerank_path: Optional[Union[str, List[str]]] = None,
+        rerank_model: Optional[str] = None,
+        num_docs_to_rerank: Optional[int] = None,
+        top_k: Optional[int] = None,
+        auto_create_index: bool = True,
+        auto_index_timeout: int = 15,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the MongoDBAtlasHybridSearchRetriever.
+
+        Args:
+            vectorstore: MongoDBAtlasVectorSearch instance.
+            search_index_name: Atlas Search Index (full-text) name.
+            k: Number of documents to return. Defaults to 4.
+            oversampling_factor: This times k is the number of candidates chosen at each step. Defaults to 10.
+            pre_filter: (Optional) Any MQL match expression comparing an indexed field.
+            post_filter: (Optional) Pipeline of MongoDB aggregation stages for postprocessing.
+            vector_penalty: Penalty applied to vector search results in RRF: scores=1/(rank + penalty). Defaults to 60.0.
+            fulltext_penalty: Penalty applied to full-text search results in RRF: scores=1/(rank + penalty). Defaults to 60.0.
+            vector_weight: Weight applied to vector search results in RRF: score = weight * (1 / (rank + penalty + 1)). Defaults to 1.0.
+            fulltext_weight: Weight applied to full-text search results in RRF: score = weight * (1 / (rank + penalty + 1)). Defaults to 1.0.
+            show_embeddings: If true, returned Document metadata will include vectors. Defaults to False.
+            rerank_path: Field or list of fields to rerank on. Enables $rerank when set.
+            rerank_model: Voyage AI reranking model. Uses latest model if omitted.
+            num_docs_to_rerank: Candidates passed to the reranker. Defaults to k. Max 1000.
+            top_k: (Deprecated) Number of documents to return. Use k instead.
+            auto_create_index: Whether to automatically create the full-text search index if it does not exist. Defaults to True.
+            auto_index_timeout: How long to wait for the automatic index creation to complete, in seconds. Defaults to 15.
+            vector_index_options: Unused; kept for backward compatibility. Defaults to None.
+            **kwargs: Additional keyword arguments.
+        """
+        super().__init__(  # type: ignore[call-arg]
+            vectorstore=vectorstore,
+            search_index_name=search_index_name,
+            k=k,
+            oversampling_factor=oversampling_factor,
+            pre_filter=pre_filter,
+            post_filter=post_filter,
+            vector_penalty=vector_penalty,
+            fulltext_penalty=fulltext_penalty,
+            vector_weight=vector_weight,
+            fulltext_weight=fulltext_weight,
+            show_embeddings=show_embeddings,
+            rerank_path=rerank_path,
+            rerank_model=rerank_model,
+            num_docs_to_rerank=num_docs_to_rerank,
+            top_k=top_k,
+            **kwargs,
+        )
+        if auto_create_index and not any(
+            ix["name"] == search_index_name
+            for ix in self.vectorstore._collection.list_search_indexes()
+        ):
+            create_fulltext_search_index(
+                collection=self.vectorstore._collection,
+                index_name=search_index_name,
+                field=self.vectorstore._text_key,
+                wait_until_complete=auto_index_timeout,
+            )
 
     @property
     def collection(self) -> Collection:
@@ -77,28 +161,55 @@ class MongoDBAtlasHybridSearchRetriever(BaseRetriever):
             List of relevant documents
         """
 
-        query_vector = self.vectorstore._embedding.embed_query(query)
+        # Prepare query for vector search (handles auto embeddings check)
+        query_input, is_autoembedding = prepare_query_for_vector_search(
+            query, self.vectorstore._embedding
+        )
 
         scores_fields = ["vector_score", "fulltext_score"]
         pipeline: List[Any] = []
 
         # Get the appropriate value for k.
-        default_k = self.top_k if self.top_k is not None else self.k
-        k = kwargs.get("k", default_k)
+        is_top_k_set = False
+        with warnings.catch_warnings():
+            # Ignore warning raised by checking the value of top_k.
+            warnings.simplefilter("ignore", DeprecationWarning)
+            if self.top_k is not None:
+                is_top_k_set = True
+        default_k = self.k if not is_top_k_set else self.top_k
+        k: int = kwargs.get("k", default_k)  # type:ignore[assignment]
 
         # First we build up the aggregation pipeline,
         # then it is passed to the server to execute
         # Vector Search stage
-        vector_pipeline = [
-            vector_search_stage(
-                query_vector=query_vector,
-                search_field=self.vectorstore._embedding_key,
-                index_name=self.vectorstore._index_name,
-                top_k=k,
-                filter=self.pre_filter,
-                oversampling_factor=self.oversampling_factor,
-            )
-        ]
+        if is_autoembedding:
+            assert isinstance(query_input, str)
+            auto_embedding = self.vectorstore._embedding  # type: ignore[attr-defined]
+            vector_pipeline = [
+                autoembedding_vector_search_stage(
+                    query=query_input,
+                    search_field=self.vectorstore._text_key,
+                    index_name=self.vectorstore._index_name,
+                    model=auto_embedding.model,  # type: ignore[attr-defined]
+                    top_k=k,
+                    filter=self.pre_filter,
+                    oversampling_factor=self.oversampling_factor,
+                )
+            ]
+        else:
+            assert self.vectorstore._embedding_key is not None
+            assert isinstance(query_input, list)
+            vector_pipeline = [
+                vector_search_stage(
+                    query_vector=query_input,
+                    search_field=self.vectorstore._embedding_key,
+                    index_name=self.vectorstore._index_name,
+                    top_k=k,
+                    filter=self.pre_filter,
+                    oversampling_factor=self.oversampling_factor,
+                )
+            ]
+
         vector_pipeline += reciprocal_rank_stage(
             score_field="vector_score",
             penalty=self.vector_penalty,
@@ -126,12 +237,25 @@ class MongoDBAtlasHybridSearchRetriever(BaseRetriever):
 
         combine_pipelines(pipeline, text_pipeline, self.collection.name)
 
-        # Sum and sort stage
-        pipeline.extend(final_hybrid_stage(scores_fields=scores_fields, limit=k))
+        # Sum and sort stage — expand limit when reranking so the reranker has candidates.
+        n_to_rerank = self.num_docs_to_rerank or k
+        hybrid_limit = n_to_rerank if self.rerank_path else k
+        pipeline.extend(
+            final_hybrid_stage(scores_fields=scores_fields, limit=hybrid_limit)
+        )
 
         # Removal of embeddings unless requested.
-        if not self.show_embeddings:
+        if not self.show_embeddings and not is_autoembedding:
             pipeline.append({"$project": {self.vectorstore._embedding_key: 0}})
+
+        # Native Reranking via $rerank (requires MongoDB 8.3+ and Atlas project setting).
+        if self.rerank_path is not None:
+            pipeline.extend(
+                rerank_stage(query, self.rerank_path, n_to_rerank, self.rerank_model)
+            )
+            if n_to_rerank > k:
+                pipeline.append({"$limit": k})
+
         # Post filtering
         if self.post_filter is not None:
             pipeline.extend(self.post_filter)

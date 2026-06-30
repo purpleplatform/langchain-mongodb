@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Union
 
@@ -14,6 +13,7 @@ from bson.json_util import dumps
 from pymongo import MongoClient
 from pymongo.cursor import Cursor
 from pymongo.errors import PyMongoError
+from pymongo_search_utils.parsing import parse_command, parse_doc_schema
 
 from langchain_mongodb.utils import DRIVER_METADATA, _append_client_metadata
 
@@ -57,7 +57,9 @@ class MongoDBDatabase:
             )
         self._include_colls = set(include_collections or [])
         self._ignore_colls = set(ignore_collections or [])
-        self._all_colls = set(self._db.list_collection_names())
+        self._all_colls = set(
+            self._db.list_collection_names(authorizedCollections=True)
+        )
 
         self._sample_docs_in_coll_info = sample_docs_in_collection_info
         self._indexes_in_coll_info = indexes_in_collection_info
@@ -140,34 +142,7 @@ class MongoDBDatabase:
     def _get_collection_schema(self, collection: str) -> str:
         coll = self._db[collection]
         doc = coll.find_one({}) or dict()
-        return "\n".join(self._parse_doc(doc, ""))
-
-    def _parse_doc(self, doc: dict[str, Any], prefix: str) -> list[str]:
-        sub_schema = []
-        for key, value in doc.items():
-            if prefix:
-                full_key = f"{prefix}.{key}"
-            else:
-                full_key = key
-            if isinstance(value, dict):
-                sub_schema.extend(self._parse_doc(value, full_key))
-            elif isinstance(value, list):
-                if not len(value):
-                    sub_schema.append(f"{full_key}: Array")
-                elif isinstance(value[0], dict):
-                    sub_schema.extend(self._parse_doc(value[0], f"{full_key}[]"))
-                else:
-                    if type(value[0]) in _BSON_LOOKUP:
-                        type_name = _BSON_LOOKUP[type(value[0])]
-                        sub_schema.append(f"{full_key}: Array<{type_name}>")
-                    else:
-                        sub_schema.append(f"{full_key}: Array")
-            elif type(value) in _BSON_LOOKUP:
-                type_name = _BSON_LOOKUP[type(value)]
-                sub_schema.append(f"{full_key}: {type_name}")
-        if not sub_schema:
-            sub_schema.append(f"{prefix}: Document")
-        return sub_schema
+        return "\n".join(parse_doc_schema(doc, ""))
 
     def _get_collection_indexes(self, collection: str) -> str:
         coll = self._db[collection]
@@ -208,18 +183,6 @@ class MongoDBDatabase:
             ):
                 doc[key] = value[: MAX_STRING_LENGTH_OF_SAMPLE_DOCUMENT_VALUE + 1]
 
-    def _parse_command(self, command: str) -> Any:
-        # Convert a JavaScript command to a python object.
-        command = re.sub(r"\s+", " ", command.strip())
-        # Handle missing closing parens.
-        if command.endswith("]"):
-            command += ")"
-        agg_command = command[command.index("[") : -1]
-        try:
-            return json.loads(agg_command)
-        except Exception as e:
-            raise ValueError(f"Cannot execute command {command}") from e
-
     def run(self, command: str) -> Union[str, Cursor]:
         """Execute a MongoDB aggregation command and return a string representing the results.
 
@@ -230,14 +193,29 @@ class MongoDBDatabase:
         """
         if not command.startswith("db."):
             raise ValueError(f"Cannot run command {command}")
-        col_name = command.split(".")[1]
+
+        try:
+            col_name = command.split(".")[1]
+        except IndexError as e:
+            raise ValueError(
+                "Invalid command format. Could not extract collection name."
+            ) from e
+
         if col_name not in self.get_usable_collection_names():
             raise ValueError(f"Collection {col_name} does not exist!")
-        coll = self._db[col_name]
+
         if ".aggregate(" not in command:
-            raise ValueError(f"Cannot execute command {command}")
-        agg = self._parse_command(command)
-        return dumps(list(coll.aggregate(agg)), indent=2)
+            raise ValueError("Only aggregate(...) queries are currently supported.")
+
+        # Parse pipeline using helper
+        agg_pipeline = parse_command(command)
+
+        try:
+            coll = self._db[col_name]
+            result = coll.aggregate(agg_pipeline)
+            return dumps(list(result), indent=2)
+        except Exception as e:
+            raise ValueError(f"Error executing aggregation: {e}") from e
 
     def get_collection_info_no_throw(
         self, collection_names: Optional[List[str]] = None

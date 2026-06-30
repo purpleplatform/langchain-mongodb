@@ -1,16 +1,15 @@
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from time import monotonic, sleep
-from typing import Callable
 
 import pytest
 from langchain_core.embeddings import Embeddings
+from langgraph.store.base import PutOp
+from langgraph.store.memory import InMemoryStore
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.errors import OperationFailure
 
-from langgraph.store.base import PutOp
-from langgraph.store.memory import InMemoryStore
 from langgraph.store.mongodb import (
     MongoDBStore,
     create_vector_index_config,
@@ -22,7 +21,7 @@ MONGODB_URI = os.environ.get(
 DB_NAME = os.environ.get("DB_NAME", "langgraph-test")
 COLLECTION_NAME = "semantic_search_async"
 INDEX_NAME = "vector_index"
-TIMEOUT, INTERVAL = 30, 1  # timeout to index new data
+TIMEOUT, INTERVAL = 60, 1  # timeout to index new data
 
 DIMENSIONS = 5  # Dimensions of embedding model
 

@@ -26,6 +26,9 @@ from typing import Any, Dict, List, Union
 import numpy as np
 from pymongo import MongoClient
 from pymongo.driver_info import DriverInfo
+from pymongo_search_utils import append_client_metadata
+
+from langchain_mongodb.embeddings import AutoEmbeddings
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +38,7 @@ DRIVER_METADATA = DriverInfo(name="Langchain", version=version("langchain-mongod
 
 
 def _append_client_metadata(client: MongoClient) -> None:
-    # append_metadata was added in PyMongo 4.14.0, but is a valid database name on earlier versions
-    if callable(client.append_metadata):
-        client.append_metadata(DRIVER_METADATA)
+    append_client_metadata(client=client, driver_info=DRIVER_METADATA)
 
 
 def cosine_similarity(X: Matrix, Y: Matrix) -> np.ndarray:
@@ -193,3 +194,37 @@ def make_serializable(
             obj[k] = oid_to_str(v)
         elif isinstance(v, (datetime, date)):
             obj[k] = v.isoformat()
+
+
+def prepare_query_for_vector_search(
+    query: str,
+    embedding: Any,
+) -> tuple[str | list[float], bool]:
+    """Prepare a query for vector search based on the embedding type.
+
+    This function checks if the embedding is an AutoEmbeddings instance.
+    If it is, the query is returned as-is (string) for server-side embedding.
+    Otherwise, the query is embedded using the embedding model's embed_query method.
+
+    Args:
+        query: The search query string.
+        embedding: The embedding model instance (either AutoEmbeddings or a standard Embeddings).
+
+    Returns:
+        A tuple containing:
+        - query_input: Either the original query string (for AutoEmbeddings) or
+          the embedded query vector (for standard embeddings)
+        - is_autoembedding: Boolean indicating whether AutoEmbeddings is being used
+    """
+
+    # Check if using auto embeddings
+    is_autoembedding = isinstance(embedding, AutoEmbeddings)
+
+    # Only embed query if not using auto embeddings
+    query_input: str | list[float]
+    if is_autoembedding:
+        query_input = query
+    else:
+        query_input = embedding.embed_query(query)
+
+    return query_input, is_autoembedding

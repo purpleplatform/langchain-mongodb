@@ -53,6 +53,10 @@ If using `ollama`, we have a convenience script to download the library used in 
 scripts/setup_ollama.sh
 ```
 
+### Dependency updates
+
+Dependabot will raise PRs at most once per week, grouped by GitHub Actions updates and Python requirement file updates. We have a pre-commit hook that will update the uv.lock files when requirements change. To update the locks file on a failing PR, you can use a method like gh pr checkout <pr number>, then run `just update-locks` to update the lock file, and then push the changes. If a typing dependency has changed, also run `just typing` in the appropriate package(s) and handle any new findings.
+
 ### Testing
 
 Unit tests cover modular logic that does not require calls to outside APIs.
@@ -131,3 +135,8 @@ just codespell
 ```
 
 If codespell is incorrectly flagging a word, you can skip spellcheck for that word by adding it to the codespell config in the `.pre-commit-config.yaml` file.
+
+### CI Configuration
+The CI configuration for this project is located in the `.github/workflows` directory.
+The `.github/scripts/check_diff.py` script is run automatically at the start of CI to determine which parts of the codebase have changed and need to be tested. I
+f you add new packages or change the directory structure, update this script accordingly.

@@ -3,7 +3,7 @@ name = "langchain-mongodb-monorepo"
 version = "0.1.0"
 description = "LangChain MongoDB mono-repo"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = []
 
@@ -15,7 +15,7 @@ dev = [
     "sphinx>=7.4.7",
     "sphinx-copybutton>=0.5.2",
     "toml>=0.10.2",
-    "langchain-core>=0.3.30",
+    "langchain-core>=1.4.0",
     "sphinxcontrib-googleanalytics>=0.4",
     "langchain-mongodb",
     "langgraph-checkpoint-mongodb",
@@ -29,3 +29,11 @@ dev = [
 langchain-mongodb = { path = "libs/langchain-mongodb", editable = true }
 langgraph-checkpoint-mongodb = { path = "libs/langgraph-checkpoint-mongodb", editable = true }
 langgraph-store-mongodb = { path = "libs/langgraph-store-mongodb", editable = true }
+
+[tool.uv]
+# The CI "minimum dependency versions" step (uv sync --resolution=lowest-direct)
+# otherwise pins numpy==1.26.0, which ships no cp313 wheel and fails to build from
+# source on the runner. Floor numpy to the first release with cp310-cp313 wheels.
+constraint-dependencies = [
+    "numpy>=2.1.0",
+]

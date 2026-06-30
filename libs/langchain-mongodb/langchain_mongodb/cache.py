@@ -14,6 +14,12 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.database import Database
 
+from langchain_mongodb.chunking import (
+    create_chunks,
+    get_chunk_collection_name,
+    load_chunked_data,
+    should_chunk,
+)
 from langchain_mongodb.utils import DRIVER_METADATA
 from langchain_mongodb.vectorstores import MongoDBAtlasVectorSearch
 
@@ -51,9 +57,11 @@ class MongoDBCache(BaseCache):
         self.client = _generate_mongo_client(connection_string)
         self.__database_name = database_name
         self.__collection_name = collection_name
-        self.chunk_collection = self.database[f"{self.__collection_name}_chunks"]
+        self.__chunk_collection_name = get_chunk_collection_name(collection_name)
 
-        if self.__collection_name not in self.database.list_collection_names():
+        if self.__collection_name not in self.database.list_collection_names(
+            authorizedCollections=True
+        ):
             self.database.create_collection(self.__collection_name)
             # Create an index on key and llm_string
             self.collection.create_index([self.PROMPT, self.LLM])
@@ -68,77 +76,55 @@ class MongoDBCache(BaseCache):
         """Returns the collection used to store cache values."""
         return self.database[self.__collection_name]
 
+    @property
+    def chunk_collection(self) -> Collection:
+        """Returns the collection used to store chunked cache values."""
+        return self.database[self.__chunk_collection_name]
+
     def close(self) -> None:
         """Close the MongoClient used by the MongoDBCache."""
         self.client.close()
 
     def lookup(self, prompt: str, llm_string: str) -> Optional[RETURN_VAL_TYPE]:
         """Look up based on prompt and llm_string."""
-        main_doc = (
+        return_doc = (
             self.collection.find_one(self._generate_keys(prompt, llm_string)) or {}
         )
-
-        if not main_doc:
-            return None
-
-        if not main_doc.get("is_chunked"):
-            return_val = main_doc.get(self.RETURN_VAL)
-            return _loads_generations(return_val) if return_val else None
-
-        chunk_key = main_doc.get("chunk_key")
-        num_chunks = main_doc.get("num_chunks")
-        if not chunk_key or not num_chunks:
-            return None
-
-        chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
-        chunk_docs_cursor = self.chunk_collection.find({"_id": {"$in": chunk_keys}})
-        docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
-
-        if len(docs_by_id) != num_chunks:
-            return None
-
-        reassembled = "".join(docs_by_id[key] for key in chunk_keys)
-        return _loads_generations(reassembled)  # type: ignore
+        if return_doc.get("is_chunked"):
+            return_val = load_chunked_data(
+                return_doc, self.RETURN_VAL, self.chunk_collection, is_bytes=False
+            )
+        else:
+            return_val = return_doc.get(self.RETURN_VAL)
+        return _loads_generations(return_val) if return_val else None  # type: ignore
 
     def update(self, prompt: str, llm_string: str, return_val: RETURN_VAL_TYPE) -> None:
         """Update cache based on prompt and llm_string."""
-        from bson import ObjectId
+        serialized = _dumps_generations(return_val)
+        query = {**self._generate_keys(prompt, llm_string)}
 
-        serialized_val = _dumps_generations(return_val)
-        chunk_size = 800 * 1024
+        if should_chunk(serialized):
+            # Clean up old chunks if they exist
+            existing = self.collection.find_one(
+                query, {"is_chunked": 1, "chunk_key": 1}
+            )
+            if existing and existing.get("is_chunked") and existing.get("chunk_key"):
+                from langchain_mongodb.chunking import delete_chunks
 
-        keys = self._generate_keys(prompt, llm_string)
+                delete_chunks(self.chunk_collection, existing["chunk_key"])
 
-        if len(serialized_val.encode("utf-8")) <= chunk_size:
+            chunk_meta = create_chunks(serialized, self.chunk_collection)
             self.collection.update_one(
-                keys,
-                {"$set": {self.RETURN_VAL: serialized_val, "is_chunked": False}},
+                query,
+                {"$set": {self.RETURN_VAL: None, **chunk_meta}},
                 upsert=True,
             )
-            return
-
-        chunk_key = str(ObjectId())
-        chunks = [
-            serialized_val[i : i + chunk_size]
-            for i in range(0, len(serialized_val), chunk_size)
-        ]
-        chunk_docs = [
-            {"_id": f"{chunk_key}_part_{i + 1}", "value": chunk}
-            for i, chunk in enumerate(chunks)
-        ]
-        self.chunk_collection.insert_many(chunk_docs)
-
-        self.collection.update_one(
-            keys,
-            {
-                "$set": {
-                    "is_chunked": True,
-                    "chunk_key": chunk_key,
-                    "num_chunks": len(chunks),
-                }
-            },
-            upsert=True,
-        )
+        else:
+            self.collection.update_one(
+                query,
+                {"$set": {self.RETURN_VAL: serialized, "is_chunked": False}},
+                upsert=True,
+            )
 
     def _generate_keys(self, prompt: str, llm_string: str) -> Dict[str, str]:
         """Create keyed fields for caching layer"""
@@ -194,9 +180,6 @@ class MongoDBAtlasSemanticCache(BaseCache, MongoDBAtlasVectorSearch):
         """
         client = _generate_mongo_client(connection_string)
         self.collection = client[database_name][collection_name]
-        self.chunk_collection = self.collection.database[
-            f"{self.collection.name}_chunks"
-        ]
         self.score_threshold = score_threshold
         self._wait_until_ready = wait_until_ready
         super().__init__(
@@ -221,28 +204,8 @@ class MongoDBAtlasSemanticCache(BaseCache, MongoDBAtlasVectorSearch):
             post_filter_pipeline=post_filter_pipeline,
         )
         if search_response:
-            metadata = search_response[0][0].metadata
-            if not metadata.get("is_chunked"):
-                return_val = metadata.get(self.RETURN_VAL)
-                response = _loads_generations(return_val) or return_val  # type: ignore
-                return response
-
-            chunk_key = metadata.get("chunk_key")
-            num_chunks = metadata.get("num_chunks")
-            if not chunk_key or not num_chunks:
-                return None
-
-            chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
-            chunk_docs_cursor = self.chunk_collection.find(
-                {"_id": {"$in": chunk_keys}}
-            )
-            docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
-
-            if len(docs_by_id) != num_chunks:
-                return None
-
-            reassembled = "".join(docs_by_id[key] for key in chunk_keys)
-            response = _loads_generations(reassembled) or reassembled  # type: ignore
+            return_val = search_response[0][0].metadata.get(self.RETURN_VAL)
+            response = _loads_generations(return_val) or return_val  # type: ignore
             return response
         return None
 
@@ -254,36 +217,15 @@ class MongoDBAtlasSemanticCache(BaseCache, MongoDBAtlasVectorSearch):
         wait_until_ready: Optional[float] = None,
     ) -> None:
         """Update cache based on prompt and llm_string."""
-        from bson import ObjectId
-
-        serialized_val = _dumps_generations(return_val)
-        chunk_size = 800 * 1024
-
-        if len(serialized_val.encode("utf-8")) <= chunk_size:
-            metadata = {
-                self.LLM: llm_string,
-                self.RETURN_VAL: serialized_val,
-                "is_chunked": False,
-            }
-        else:
-            chunk_key = str(ObjectId())
-            chunks = [
-                serialized_val[i : i + chunk_size]
-                for i in range(0, len(serialized_val), chunk_size)
-            ]
-            chunk_docs = [
-                {"_id": f"{chunk_key}_part_{i + 1}", "value": chunk}
-                for i, chunk in enumerate(chunks)
-            ]
-            self.chunk_collection.insert_many(chunk_docs)
-            metadata = {
-                self.LLM: llm_string,
-                "is_chunked": True,
-                "chunk_key": chunk_key,
-                "num_chunks": len(chunks),
-            }
-
-        self.add_texts([prompt], [metadata])
+        self.add_texts(
+            [prompt],
+            [
+                {
+                    self.LLM: llm_string,
+                    self.RETURN_VAL: _dumps_generations(return_val),
+                }
+            ],
+        )
         wait = self._wait_until_ready if wait_until_ready is None else wait_until_ready
 
         def is_indexed() -> bool:
@@ -359,7 +301,10 @@ def _loads_generations(generations_str: str) -> Union[RETURN_VAL_TYPE, None]:
 
     """
     try:
-        generations = [loads(_item_str) for _item_str in json.loads(generations_str)]
+        generations = [
+            loads(_item_str, allowed_objects="core")
+            for _item_str in json.loads(generations_str)
+        ]
         return generations
     except (json.JSONDecodeError, TypeError):
         # deferring the (soft) handling to after the legacy-format attempt

@@ -1,21 +1,20 @@
 import logging
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, TypedDict, Union
 
 from bson import SON
 from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import run_in_executor
-from langchain_mongodb.index import create_vector_search_index
-from langchain_mongodb.pipelines import vector_search_stage
-from pymongo import (
-    DeleteOne,
-    MongoClient,
-    UpdateOne,
+from langchain_mongodb.chunking import (
+    create_chunks,
+    delete_chunks,
+    get_chunk_collection_name,
+    load_chunked_data,
+    should_chunk,
 )
-from pymongo.collection import Collection, ReturnDocument
-
+from langchain_mongodb.embeddings import AutoEmbeddings
 from langgraph.store.base import (
     BaseStore,
     GetOp,
@@ -36,9 +35,67 @@ from langgraph.store.base.embed import (
     ensure_embeddings,
     get_text_at_path,
 )
-from langgraph.store.mongodb.utils import DRIVER_METADATA, _append_client_metadata
+from pymongo import (
+    DeleteOne,
+    MongoClient,
+    UpdateOne,
+)
+from pymongo.collection import Collection, ReturnDocument
+from pymongo_search_utils import (
+    append_client_metadata,
+    autoembedding_vector_search_stage,
+    create_vector_search_index,
+    vector_search_stage,
+)
+
+from langgraph.store.mongodb.utils import DRIVER_METADATA
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_filter(filter_dict: dict[str, Any]) -> None:
+    for key, value in filter_dict.items():
+        if not isinstance(key, str) or key.startswith("$"):
+            raise ValueError(
+                f"Invalid filter key '{key}': MongoDB operator keys are not allowed."
+            )
+        if isinstance(value, dict):
+            _validate_filter(value)
+
+
+class RerankConfig(TypedDict, total=False):
+    """Configuration for native reranking via the $rerank aggregation stage.
+
+    Reranking runs entirely server-side on MongoDB Atlas — no Voyage AI SDK or
+    client-side API key is required.  Atlas calls the Voyage AI reranker API on
+    your behalf using a key you configure in Atlas Project Settings.
+
+    Prerequisites (all must be satisfied before results are reranked):
+      1. MongoDB Atlas cluster running MongoDB 8.3+.
+      2. Native Reranking enabled in Atlas Project Settings.
+      3. A Voyage AI API key configured in Atlas Project Settings.
+
+    If any prerequisite is missing, ``search()`` will return constant scores
+    (e.g. ``0.5987``) for all documents rather than raising an error.
+
+    Attributes:
+        model: Voyage AI reranking model (e.g. ``"rerank-2.5-lite"``).
+            Omit to use the latest available model.
+        num_docs_to_rerank: Number of candidates passed from $vectorSearch to the
+            reranker. Must be >= the ``limit`` passed to ``search()`` and <= 1000
+            (the MongoDB maximum for ``$rerank``). Defaults to
+            ``min(limit * oversampling_factor, 1000)``, which satisfies both
+            constraints as long as ``limit`` itself is <= 1000. Passing
+            ``limit > 1000`` with reranking enabled raises a ``ValueError`` at
+            search time.
+        oversampling_factor: Multiplier applied to ``limit`` when computing the
+            default ``num_docs_to_rerank``. Ignored when ``num_docs_to_rerank``
+            is set explicitly. Defaults to 10.
+    """
+
+    model: str
+    num_docs_to_rerank: int
+    oversampling_factor: int
 
 
 class VectorIndexConfig(IndexConfig, total=False):
@@ -59,7 +116,7 @@ class VectorIndexConfig(IndexConfig, total=False):
     name: str
     """Name of the index attached to the Collection in the Atlas Database."""
 
-    relevance_score_fn: Literal["euclidean", "cosine", "dotProduct"]
+    relevance_score_fn: Literal["euclidean", "cosine", "dotProduct", None]
     """Similarity scoring function used to compare vectors."""
 
     embedding_key: str
@@ -67,6 +124,10 @@ class VectorIndexConfig(IndexConfig, total=False):
 
     MongoDB does not require a separate Vector Store.
     It is designed to have one vector per document.
+
+    NOTE: If using AutoEmbeddings, the vectors are not explicitly stored in the Collection.
+    Set dims to -1, relevance_score_fn to None.
+    The embedding_key will not store vectors. Instead, it will be the texts to be embedded.
     """
 
     filters: list[str]
@@ -85,12 +146,12 @@ class VectorIndexConfig(IndexConfig, total=False):
 
 
 def create_vector_index_config(
-    dims: int,
+    dims: int | None,
     embed: Union[Embeddings, EmbeddingsFunc, AEmbeddingsFunc, str],
     fields: Optional[list[str]] = None,
     name: str = "vector_index",
-    relevance_score_fn: Literal["euclidean", "cosine", "dotProduct"] = "cosine",
-    embedding_key: str = "embedding",
+    relevance_score_fn: Literal["euclidean", "cosine", "dotProduct", None] = "cosine",
+    embedding_key: str | None = "embedding",
     filters: Optional[list[str]] = None,
 ) -> VectorIndexConfig:
     """Factory function creates a VectorIndexConfig instance with sensible defaults.
@@ -142,6 +203,8 @@ class MongoDBStore(BaseStore):
         ttl_config: Optional[TTLConfig] = None,
         index_config: Optional[VectorIndexConfig] = None,
         auto_index_timeout: int = 15,
+        query_model: str | None = None,
+        rerank_config: Optional[RerankConfig] = None,
         **kwargs: Any,
     ):
         """Construct store and its indexes.
@@ -154,28 +217,80 @@ class MongoDBStore(BaseStore):
             ttl_config: Optionally define a TTL and whether to update on reads(get/search).
             index_config: Optionally define a VectorIndexConfig for semantic search.
             auto_index_timeout: Optional timeout for creation of indexes.
+            query_model: For semantic search, optionally provide a different model for search than indexing.
+            rerank_config: Optionally enable native reranking via $rerank after vector
+                search. Requires MongoDB Atlas 8.3+, Native Reranking enabled in
+                Atlas Project Settings, and a Voyage AI API key configured in Atlas.
+                ``index_config`` must also be set. See ``RerankConfig`` for details.
 
         Returns:
             Instance of MongoDBStore.
         """
+        if rerank_config is not None and not index_config:
+            raise ValueError("rerank_config requires index_config to be set")
+        self._rerank_config: Optional[RerankConfig] = rerank_config or {}
 
         self.collection = collection
-        self.chunk_collection = self.collection.database[
-            f"{self.collection.name}_chunks"
+        self.chunk_collection = collection.database[
+            get_chunk_collection_name(collection.name)
         ]
         self.ttl_config = {} if ttl_config is None else ttl_config
         self.index_config = {} if index_config is None else index_config
-        self._index_name = self.index_config.get("name", "vector_index")
-        self._relevance_score_fn = self.index_config.get("relevance_score_fn", "cosine")
-        self._embedding_key = self.index_config.get("embedding_key", "embedding")
+        self.sep = kwargs.get("sep", "/")
 
-        _append_client_metadata(self.collection.database.client)
+        append_client_metadata(
+            client=self.collection.database.client, driver_info=DRIVER_METADATA
+        )
 
         # Create indexes if not present
-        # Create a unique index, akin to primary key, on namespace + key
-        idx_keys = [idx["key"] for idx in self.collection.list_indexes()]
-        if SON([("namespace", 1), ("key", 1)]) not in idx_keys:
-            self.collection.create_index(keys=["namespace", "key"], unique=True)
+        # Unique compound index on (namespace_str, key) acts as the primary key.
+        # namespace_str is the namespace tuple joined into a single string (e.g.
+        # "users/alice/preferences"), which avoids the multikey-index collision
+        # that occurs when indexing the namespace array directly.
+        indexes = list(self.collection.list_indexes())
+        idx_keys = [idx["key"] for idx in indexes]
+        # Always backfill namespace_str on legacy documents. Reads and deletes
+        # now filter on namespace_str, so any document missing it is unreachable.
+        # This also runs if the index already exists but an old client wrote new
+        # documents without namespace_str after the migration.
+        backfill_batch: list[UpdateOne] = []
+        for doc in self.collection.find(
+            {"namespace_str": {"$exists": False}},
+            {"_id": 1, "namespace": 1},
+        ):
+            namespace = doc.get("namespace") or ()
+            self._validate_namespace(namespace)
+            backfill_batch.append(
+                UpdateOne(
+                    {"_id": doc["_id"], "namespace_str": {"$exists": False}},
+                    {"$set": {"namespace_str": self.sep.join(namespace)}},
+                )
+            )
+            if len(backfill_batch) >= 1000:
+                self.collection.bulk_write(backfill_batch, ordered=False)
+                backfill_batch = []
+        if backfill_batch:
+            self.collection.bulk_write(backfill_batch, ordered=False)
+        # Check for the unique index by both key pattern and unique option, so
+        # a non-unique index with the same key pattern does not suppress creation.
+        # If a conflicting non-unique index exists, drop it first — otherwise
+        # create_index(..., unique=True) raises IndexOptionsConflict.
+        ns_str_key = SON([("namespace_str", 1), ("key", 1)])
+        ns_str_indexes = [idx for idx in indexes if idx["key"] == ns_str_key]
+        has_unique_ns_idx = any(idx.get("unique", False) for idx in ns_str_indexes)
+        if not has_unique_ns_idx:
+            conflicting = next(
+                (idx for idx in ns_str_indexes if not idx.get("unique", False)), None
+            )
+            if conflicting is not None:
+                self.collection.drop_index(conflicting["name"])
+            self.collection.create_index(keys=["namespace_str", "key"], unique=True)
+        # Drop the legacy multikey index only after the new unique index exists,
+        # so there is never a window with no uniqueness enforcement.
+        # Re-query to avoid acting on a stale snapshot (e.g. concurrent init).
+        current_idx_keys = [idx["key"] for idx in self.collection.list_indexes()]
+        if SON([("namespace", 1), ("key", 1)]) in current_idx_keys:
+            self.collection.drop_index([("namespace", 1), ("key", 1)])
 
         # Optionally, expire values using [TTL Index](https://www.mongodb.com/docs/manual/core/index-ttl/)
         if (
@@ -196,7 +311,19 @@ class MongoDBStore(BaseStore):
             self.embeddings: Embeddings = ensure_embeddings(
                 self.index_config.get("embed"),
             )
-            self.sep = kwargs.get("sep", "/")  # used for prefix denormalization/search
+            self._index_name = self.index_config.get("name", "vector_index")
+            self._relevance_score_fn = self.index_config.get(
+                "relevance_score_fn", "cosine"
+            )
+            self._embedding_key = self.index_config.get("embedding_key", "embedding")
+            auto_embedding_model = None
+            self._is_autoembedding = False
+            if isinstance(self.embeddings, AutoEmbeddings):
+                self._is_autoembedding = True
+                auto_embedding_model = self.embeddings.model
+                self.query_model = (
+                    self.embeddings.model if query_model is None else query_model
+                )
 
             # Create the vector index if it does not yet exist
             if not any(
@@ -213,6 +340,7 @@ class MongoDBStore(BaseStore):
                     similarity=self._relevance_score_fn,
                     filters=self.index_filters,
                     wait_until_complete=auto_index_timeout,
+                    auto_embedding_model=auto_embedding_model,
                 )
 
     @classmethod
@@ -228,9 +356,12 @@ class MongoDBStore(BaseStore):
     ) -> Iterator["MongoDBStore"]:
         """Context manager to create a persistent MongoDB key-value store.
 
-        A unique compound index as shown below will be added to the collections
-        backing the store (namespace, key). If the collection exists,
-        and have indexes already, nothing will be done during initialization.
+        A unique compound index will be added to the collections backing the
+        store on (namespace_str, key). On first initialization of an existing
+        collection, legacy documents are backfilled with a namespace_str field
+        and the old (namespace, key) index is replaced. On every initialization,
+        documents missing namespace_str are backfilled; all other steps are
+        no-ops if the collection is already up to date.
 
         If the `ttl` argument is provided, TTL functionality will be employed.
         This is done automatically via MongoDB's TTL Indexes, based on the
@@ -254,7 +385,9 @@ class MongoDBStore(BaseStore):
                 driver=DRIVER_METADATA,
             )
             db = client[db_name]
-            if collection_name not in db.list_collection_names():
+            if collection_name not in db.list_collection_names(
+                authorizedCollections=True
+            ):
                 db.create_collection(collection_name)
             collection = client[db_name][collection_name]
 
@@ -287,46 +420,30 @@ class MongoDBStore(BaseStore):
         Returns:
             The retrieved item or None if not found.
         """
+        self._validate_namespace(namespace)
+        ns_str = self.sep.join(namespace)
         if refresh_ttl is False or (
             self.ttl_config and not self.ttl_config["refresh_on_read"]
         ):
             res = self.collection.find_one(
-                filter={"namespace": namespace, "key": key},
+                filter={"namespace_str": ns_str, "key": key},
             )
         else:
             res = self.collection.find_one_and_update(
-                filter={"namespace": namespace, "key": key},
+                filter={"namespace_str": ns_str, "key": key},
                 update={"$set": {"updated_at": datetime.now(tz=timezone.utc)}},
                 return_document=ReturnDocument.AFTER,
             )
         if res:
-            if not res.get("is_chunked"):
-                return Item(
-                    value=res["value"],
-                    key=res["key"],
-                    namespace=tuple(res["namespace"]),
-                    created_at=res["created_at"],
-                    updated_at=res["updated_at"],
+            if res.get("is_chunked"):
+                from bson import BSON
+
+                raw = load_chunked_data(
+                    res, "value", self.chunk_collection, is_bytes=True
                 )
-
-            chunk_key = res.get("chunk_key")
-            num_chunks = res.get("num_chunks")
-            if not chunk_key or not num_chunks:
-                return None
-
-            chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
-            chunk_docs_cursor = self.chunk_collection.find(
-                {"_id": {"$in": chunk_keys}}
-            )
-            docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
-
-            if len(docs_by_id) != num_chunks:
-                return None
-
-            reassembled = b"".join(docs_by_id[key] for key in chunk_keys)
-            from bson import BSON
-
-            value = BSON(reassembled).decode()
+                value = BSON(raw).decode() if raw else res.get("value")
+            else:
+                value = res["value"]
             return Item(
                 value=value,
                 key=res["key"],
@@ -342,7 +459,26 @@ class MongoDBStore(BaseStore):
             namespace: Hierarchical path for the item.
             key: Unique identifier within the namespace.
         """
-        self.collection.delete_one({"namespace": list(namespace), "key": key})
+        self._validate_namespace(namespace)
+        query = {"namespace_str": self.sep.join(namespace), "key": key}
+        # Clean up chunks before deleting
+        existing = self.collection.find_one(query, {"is_chunked": 1, "chunk_key": 1})
+        if existing and existing.get("is_chunked") and existing.get("chunk_key"):
+            delete_chunks(self.chunk_collection, existing["chunk_key"])
+        self.collection.delete_one(query)
+
+    def _validate_namespace(self, namespace: Sequence[str]) -> None:
+        """Raise ValueError if any namespace part is empty or contains the separator."""
+        for part in namespace:
+            if not part:
+                raise ValueError(
+                    f"Namespace parts must not be empty. Got namespace: {namespace}"
+                )
+            if self.sep in part:
+                raise ValueError(
+                    f"Namespace parts must not contain the separator {self.sep!r}. "
+                    f"Got namespace: {namespace}"
+                )
 
     @staticmethod
     def _match_prefix(prefix: NamespacePath) -> dict[str, Any]:
@@ -464,6 +600,7 @@ class MongoDBStore(BaseStore):
 
         for op in ops:
             if isinstance(op, PutOp):
+                self._validate_namespace(op.namespace)
                 dedupped_putops[(op.namespace, op.key)] = op
                 results.append(None)
 
@@ -510,61 +647,73 @@ class MongoDBStore(BaseStore):
                         offset=op.offset,
                     )
                 )
-        from bson import BSON, ObjectId
-
         # Apply puts and deletes in bulk
         # Extract texts to embed for each op
         if self.index_config:
             texts = self._extract_texts(list(dedupped_putops.values()))
-            vectors = self.embeddings.embed_documents(texts)
+            if not self._is_autoembedding:
+                vectors = self.embeddings.embed_documents(texts)
             v = 0
         for op in dedupped_putops.values():
+            ns_str = self.sep.join(op.namespace)
             if op.value is None:
-                # mark the item for deletion.
-                writes.append(
-                    DeleteOne(filter={"namespace": list(op.namespace), "key": op.key})
+                # Clean up chunks before deleting
+                op_filter = {"namespace_str": ns_str, "key": op.key}
+                existing = self.collection.find_one(
+                    op_filter, {"is_chunked": 1, "chunk_key": 1}
                 )
+                if (
+                    existing
+                    and existing.get("is_chunked")
+                    and existing.get("chunk_key")
+                ):
+                    delete_chunks(self.chunk_collection, existing["chunk_key"])
+                # mark the item for deletion.
+                writes.append(DeleteOne(filter=op_filter))
             else:
-                # Add or Upsert the value
-                serialized_val = BSON.encode(op.value)
-                chunk_size = 800 * 1024
+                from bson import BSON
 
-                if len(serialized_val) <= chunk_size:
-                    to_set = {
-                        "value": op.value,
-                        "updated_at": datetime.now(tz=timezone.utc),
-                        "is_chunked": False,
-                    }
+                op_filter = {"namespace_str": ns_str, "key": op.key}
+
+                # Clean up old chunks if this item was previously chunked
+                existing = self.collection.find_one(
+                    op_filter, {"is_chunked": 1, "chunk_key": 1}
+                )
+                if (
+                    existing
+                    and existing.get("is_chunked")
+                    and existing.get("chunk_key")
+                ):
+                    delete_chunks(self.chunk_collection, existing["chunk_key"])
+
+                serialized = BSON.encode(op.value)
+                # Add or Upsert the value
+                to_set: dict[str, Any] = {
+                    "namespace_str": ns_str,
+                    "updated_at": datetime.now(tz=timezone.utc),
+                }
+
+                if should_chunk(serialized):
+                    chunk_meta = create_chunks(serialized, self.chunk_collection)
+                    to_set.update(chunk_meta)
+                    to_set["value"] = None
                 else:
-                    chunk_key = str(ObjectId())
-                    chunks = [
-                        serialized_val[i : i + chunk_size]
-                        for i in range(0, len(serialized_val), chunk_size)
-                    ]
-                    chunk_docs = [
-                        {"_id": f"{chunk_key}_part_{i + 1}", "value": chunk}
-                        for i, chunk in enumerate(chunks)
-                    ]
-                    self.chunk_collection.insert_many(chunk_docs)
-                    to_set = {
-                        "updated_at": datetime.now(tz=timezone.utc),
-                        "is_chunked": True,
-                        "chunk_key": chunk_key,
-                        "num_chunks": len(chunks),
-                    }
+                    to_set["value"] = op.value
+                    to_set["is_chunked"] = False
 
                 if self.index_config:
-                    if not to_set.get("is_chunked"):
-                        to_set[self._embedding_key] = vectors[v]
+                    embed = texts[v] if self._is_autoembedding else vectors[v]
+                    to_set[self._embedding_key] = embed
                     to_set["namespace_prefix"] = self._denormalize_path(op.namespace)
                     v += 1
 
                 writes.append(
                     UpdateOne(
-                        filter={"namespace": list(op.namespace), "key": op.key},
+                        filter=op_filter,
                         update={
                             "$set": to_set,
                             "$setOnInsert": {
+                                "namespace": list(op.namespace),
                                 "created_at": datetime.now(tz=timezone.utc),
                             },
                         },
@@ -650,6 +799,7 @@ class MongoDBStore(BaseStore):
         if filter:
             if any(f.startswith("value") for f in filter):
                 raise ValueError("filters should be specified without `value`")
+            _validate_filter(filter)
 
         if query is None:
             # Case 1. $match namespace and filter
@@ -664,73 +814,109 @@ class MongoDBStore(BaseStore):
             if limit:
                 pipeline.append({"$limit": limit})
 
-        else:
+        elif query:
             # Case 2. $vectorSearch on query filtered on namespace and optional filters
 
-            # Compute embedding
-            query_vector = self.embeddings.embed_query(query)
             # Form filter condition for namespace_prefix
             filter_vec = {"namespace_prefix": self.sep.join(namespace_prefix)}
             if filter:  # and add any specified
                 filter_cond = [{f"value.{k}": v} for k, v in filter.items()]
                 filter_vec = {"$and": [filter_vec] + filter_cond}
 
-            pipeline = [
-                vector_search_stage(
-                    query_vector=query_vector,
-                    search_field=self._embedding_key,
-                    index_name=self._index_name,
-                    top_k=limit,
-                    filter=filter_vec,
-                ),
-                {"$set": {"score": {"$meta": "vectorSearchScore"}}},
-                {"$project": {self._embedding_key: 0}},
-            ]
+            # Expand the vector search limit so the reranker has enough candidates.
+            if self._rerank_config and limit > 1000:
+                raise ValueError(
+                    f"search(limit={limit}) exceeds the $rerank maximum of 1000. "
+                    "Reduce limit or disable reranking."
+                )
+            n_to_rerank = (
+                self._rerank_config.get(
+                    "num_docs_to_rerank",
+                    min(
+                        limit * self._rerank_config.get("oversampling_factor", 10),
+                        1000,
+                    ),
+                )
+                if self._rerank_config
+                else limit
+            )
+            vector_limit = n_to_rerank if self._rerank_config else limit
+
+            if not self._is_autoembedding:
+                query_vector = self.embeddings.embed_query(query)
+                pipeline = [
+                    vector_search_stage(
+                        query_vector=query_vector,
+                        search_field=self._embedding_key,
+                        index_name=self._index_name,
+                        top_k=vector_limit,
+                        filter=filter_vec,
+                    ),
+                    {"$set": {"score": {"$meta": "vectorSearchScore"}}},
+                    {"$project": {self._embedding_key: 0}},
+                ]
+            else:
+                # Case 2b.  $vectorSearch uses autoEmbed index.
+                pipeline = [
+                    autoembedding_vector_search_stage(
+                        query=query,
+                        search_field=self._embedding_key,
+                        index_name=self._index_name,
+                        model=self.query_model,
+                        top_k=vector_limit,
+                        filter=filter_vec,
+                    ),
+                    {"$set": {"score": {"$meta": "vectorSearchScore"}}},
+                ]
+
+            # Native Reranking via $rerank. Requires MongoDB 8.3+, Native Reranking
+            # enabled in Atlas Project Settings, and a Voyage AI API key configured
+            # in Atlas. Will migrate to pymongo_search_utils once available there.
+            #
+            # $rerank only supports top-level field paths, so we temporarily surface
+            # value.<index_field> as a top-level field, rerank on it, then remove it.
+            if self._rerank_config:
+                _rerank_text = "_rerank_text"
+                rerank_spec: dict[str, Any] = {
+                    "query": {"text": query},
+                    "path": _rerank_text,
+                    "numDocsToRerank": n_to_rerank,
+                }
+                if "model" in self._rerank_config:
+                    rerank_spec["model"] = self._rerank_config["model"]
+                pipeline.extend(
+                    [
+                        {"$addFields": {_rerank_text: f"$value.{self.index_field}"}},
+                        {"$rerank": rerank_spec},
+                        {"$set": {"score": {"$meta": "score"}}},
+                        {"$unset": _rerank_text},
+                        {"$limit": limit},
+                    ]
+                )
 
         results = self.collection.aggregate(pipeline)
 
         items = []
         for res in results:
-            if not res.get("is_chunked"):
-                items.append(
-                    SearchItem(
-                        namespace=tuple(res["namespace"]),
-                        key=res["key"],
-                        value=res["value"],
-                        created_at=res["created_at"],
-                        updated_at=res["updated_at"],
-                        score=res.get("score"),
-                    )
-                )
-            else:
-                chunk_key = res.get("chunk_key")
-                num_chunks = res.get("num_chunks")
-                if not chunk_key or not num_chunks:
-                    continue
-
-                chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
-                chunk_docs_cursor = self.chunk_collection.find(
-                    {"_id": {"$in": chunk_keys}}
-                )
-                docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
-
-                if len(docs_by_id) != num_chunks:
-                    continue
-
-                reassembled = b"".join(docs_by_id[key] for key in chunk_keys)
+            if res.get("is_chunked"):
                 from bson import BSON
 
-                value = BSON(reassembled).decode()
-                items.append(
-                    SearchItem(
-                        namespace=tuple(res["namespace"]),
-                        key=res["key"],
-                        value=value,
-                        created_at=res["created_at"],
-                        updated_at=res["updated_at"],
-                        score=res.get("score"),
-                    )
+                raw = load_chunked_data(
+                    res, "value", self.chunk_collection, is_bytes=True
                 )
+                value = BSON(raw).decode() if raw else res.get("value")
+            else:
+                value = res["value"]
+            items.append(
+                SearchItem(
+                    namespace=tuple(res["namespace"]),
+                    key=res["key"],
+                    value=value,
+                    created_at=res["created_at"],
+                    updated_at=res["updated_at"],
+                    score=res.get("score"),
+                )
+            )
         return items
 
     def _denormalize_path(self, paths: Union[tuple[str, ...], list[str]]) -> list[str]:

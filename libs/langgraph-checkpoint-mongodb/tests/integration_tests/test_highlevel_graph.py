@@ -15,18 +15,18 @@ It also demonstrates the high-level API of subgraphs, add_conditional_edges, and
 import operator
 import os
 import time
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import Generator
 from typing import Annotated
 
 import pytest
 from langchain_core.runnables import RunnableConfig
-from typing_extensions import TypedDict
-
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.mongodb import AsyncMongoDBSaver, MongoDBSaver
 from langgraph.constants import START, Send
 from langgraph.graph import END, StateGraph
+from typing_extensions import TypedDict
+
+from langgraph.checkpoint.mongodb import MongoDBSaver
 
 # --- Configuration ---
 MONGODB_URI = os.environ.get(
@@ -87,7 +87,7 @@ def fanout_to_subgraph() -> StateGraph:
         return [Send("generate_joke", {"subject": s}) for s in state["subjects"]]
 
     parentgraph = StateGraph(OverallState)
-    parentgraph.add_node("generate_joke", subgraphc)  # type: ignore[arg-type]
+    parentgraph.add_node("generate_joke", subgraphc)
     parentgraph.add_conditional_edges(START, fanout)
     parentgraph.add_edge("generate_joke", END)
     return parentgraph
@@ -119,21 +119,6 @@ def checkpointer_mongodb() -> Generator[MongoDBSaver, None, None]:
         checkpointer.writes_collection.drop()
 
 
-@pytest.fixture(scope="function")
-async def checkpointer_mongodb_async() -> AsyncGenerator[AsyncMongoDBSaver, None]:
-    async with AsyncMongoDBSaver.from_conn_string(
-        MONGODB_URI,
-        db_name=DB_NAME,
-        checkpoint_collection_name=CHECKPOINT_CLXN_NAME + "_async",
-        writes_collection_name=WRITES_CLXN_NAME + "_async",
-    ) as checkpointer:
-        await checkpointer.checkpoint_collection.delete_many({})
-        await checkpointer.writes_collection.delete_many({})
-        yield checkpointer
-        await checkpointer.checkpoint_collection.drop()
-        await checkpointer.writes_collection.drop()
-
-
 @pytest.fixture(autouse=True)
 def disable_langsmith() -> None:
     """Disable LangSmith tracing for all tests"""
@@ -144,12 +129,10 @@ def disable_langsmith() -> None:
 async def test_fanout(
     joke_subjects: OverallState,
     checkpointer_mongodb: MongoDBSaver,
-    checkpointer_mongodb_async: AsyncMongoDBSaver,
     checkpointer_memory: InMemorySaver,
 ) -> None:
     checkpointers = {
         "mongodb": checkpointer_mongodb,
-        "mongodb_async": checkpointer_mongodb_async,
         "in_memory": checkpointer_memory,
         "in_memory_async": checkpointer_memory,
     }
@@ -161,18 +144,82 @@ async def test_fanout(
         config: RunnableConfig = {"configurable": {"thread_id": cname}}
         start = time.monotonic()
         if "async" in cname:
-            out = [c async for c in graphc.astream(joke_subjects, config=config)]  # type: ignore[arg-type]
+            out = [c async for c in graphc.astream(joke_subjects, config=config)]
         else:
-            out = [c for c in graphc.stream(joke_subjects, config=config)]  # type: ignore[arg-type]
+            out = [c for c in graphc.stream(joke_subjects, config=config)]
         assert len(out) == N_SUBJECTS
         assert isinstance(out[0], dict)
         assert out[0].keys() == {"generate_joke"}
         assert set(out[0]["generate_joke"].keys()) == {"jokes"}
         assert all(
             res["generate_joke"]["jokes"][0].endswith(
-                f'{" and the year before" * 3}... and cats!'
+                f"{' and the year before' * 3}... and cats!"
             )
             for res in out
         )
         end = time.monotonic()
         print(f"{cname}: {end - start:.4f} seconds")
+
+
+async def test_custom_properties_async(checkpointer_mongodb: MongoDBSaver) -> None:
+    # Create the state graph
+    state_graph = fanout_to_subgraph()
+
+    # Define configuration with thread ID and assistant ID
+    assistant_id = "456"
+    user_id = "789"
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "123",
+            "assistant_id": assistant_id,
+            "user_id": user_id,
+        }
+    }
+
+    # Compile the state graph with the provided checkpointing mechanism
+    compiled_state_graph = state_graph.compile(checkpointer=checkpointer_mongodb)
+
+    # Invoke the compiled state graph with user input
+    await compiled_state_graph.ainvoke(
+        input={"subjects": [], "step": 0},
+        config=config,
+        stream_mode="values",
+        debug=False,
+    )
+
+    checkpoint_tuple = await checkpointer_mongodb.aget_tuple(config)
+    assert checkpoint_tuple is not None
+    assert checkpoint_tuple.metadata["user_id"] == user_id
+    assert checkpoint_tuple.metadata["assistant_id"] == assistant_id
+
+
+def test_custom_properties(checkpointer_mongodb: MongoDBSaver) -> None:
+    # Create the state graph
+    state_graph = fanout_to_subgraph()
+
+    # Define configuration with thread ID and assistant ID
+    assistant_id = "456"
+    user_id = "789"
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "123",
+            "assistant_id": assistant_id,
+            "user_id": user_id,
+        }
+    }
+
+    # Compile the state graph with the provided checkpointing mechanism
+    compiled_state_graph = state_graph.compile(checkpointer=checkpointer_mongodb)
+
+    # Invoke the compiled state graph with user input
+    compiled_state_graph.invoke(
+        input={"subjects": [], "step": 0},
+        config=config,
+        stream_mode="values",
+        debug=False,
+    )
+
+    checkpoint_tuple = checkpointer_mongodb.get_tuple(config)
+    assert checkpoint_tuple is not None
+    assert checkpoint_tuple.metadata["user_id"] == user_id
+    assert checkpoint_tuple.metadata["assistant_id"] == assistant_id

@@ -3,7 +3,16 @@ from __future__ import annotations
 import json
 import logging
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    TypeAlias,
+    Union,
+)
 
 from langchain_core.documents import Document
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -16,18 +25,17 @@ from pymongo.results import BulkWriteResult
 
 from langchain_mongodb.graphrag import example_templates, prompts
 
+from ..pipelines import rerank_stage
 from ..utils import DRIVER_METADATA, _append_client_metadata
 from .prompts import rag_prompt
 from .schema import entity_schema
 
 if TYPE_CHECKING:
-    try:
-        from typing import TypeAlias  # type:ignore[attr-defined]  # Python 3.10+
-    except ImportError:
-        from typing_extensions import TypeAlias  # Python 3.9 fallback
-
     Entity: TypeAlias = Dict[str, Any]
     """Represents an Entity in the knowledge graph with specific schema. See .schema"""
+
+    import holoviews  # type: ignore[import-untyped]
+    import networkx
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +79,7 @@ class MongoDBGraphStore:
 
     In MongoDB, Knowledge Graphs are stored in a single Collection.
     Each MongoDB Document represents a single entity (node),
-    and it relationships (edges) are defined in a nested field named
+    and its relationships (edges) are defined in a nested field named
     "relationships". The schema, and an example, are described in the
     :data:`~langchain_mongodb.graphrag.prompts.entity_context` prompts module.
 
@@ -104,6 +112,9 @@ class MongoDBGraphStore:
         entity_name_examples: str = "",
         validate: bool = False,
         validation_action: str = "warn",
+        rerank_path: Optional[Union[str, List[str]]] = None,
+        rerank_model: Optional[str] = None,
+        num_docs_to_rerank: int = 1000,
     ):
         """
         Args:
@@ -126,6 +137,15 @@ class MongoDBGraphStore:
             validation_action: One of {"warn", "error"}.
               - If "warn", the default, documents will be inserted but errors logged.
               - If "error", an exception will be raised if any document does not match the schema.
+            rerank_path: Field or list of fields on entity documents to rerank on.
+                Enables $rerank when set. The entity ``_id`` (name) is a natural choice.
+                Requires MongoDB 8.3+ and Native Reranking enabled in Atlas.
+            rerank_model: Voyage AI reranking model (e.g. ``"rerank-2.5-lite"``).
+                Uses latest model if omitted.
+            num_docs_to_rerank: Number of graph traversal results passed to the
+                reranker. Lower values reduce reranking cost; higher values give the
+                reranker a larger candidate pool. Defaults to 1000, the MongoDB
+                maximum.
         """
         self._schema = deepcopy(entity_schema)
         collection_existed = True
@@ -142,7 +162,9 @@ class MongoDBGraphStore:
                 driver=DRIVER_METADATA,
             )
             db = client[database_name]
-            if collection_name not in db.list_collection_names():
+            if collection_name not in db.list_collection_names(
+                authorizedCollections=True
+            ):
                 validator = {"$jsonSchema": self._schema} if validate else None
                 collection = client[database_name].create_collection(
                     collection_name,
@@ -201,6 +223,9 @@ class MongoDBGraphStore:
         self.entity_name_examples = entity_name_examples
 
         self.max_depth = max_depth
+        self.rerank_path = rerank_path
+        self.rerank_model = rerank_model
+        self.num_docs_to_rerank = num_docs_to_rerank
         self._schema = deepcopy(entity_schema)
         if allowed_entity_types:
             self.allowed_entity_types = allowed_entity_types
@@ -430,6 +455,7 @@ class MongoDBGraphStore:
         self,
         starting_entities: List[str],
         max_depth: Optional[int] = None,
+        rerank_query: Optional[str] = None,
     ) -> List[Entity]:
         """Traverse Graph along relationship edges to find connected entities.
 
@@ -437,9 +463,11 @@ class MongoDBGraphStore:
             starting_entities: Traversal begins with documents whose _id fields match these strings.
             max_depth: Recursion continues until no more matching documents are found,
                 or until the operation reaches a recursion depth specified by this parameter.
+            rerank_query: Original text query used for $rerank scoring.
+                Required when ``rerank_path`` is set on the store.
 
         Returns:
-            List of connected entities.
+            List of connected entities, reranked by relevance if ``rerank_path`` is set on the store.
         """
         pipeline = [
             # Match starting entities
@@ -495,9 +523,31 @@ class MongoDBGraphStore:
                 }
             },
         ]
+
+        # Native Reranking via $rerank on graph results (requires MongoDB 8.3+).
+        # Particularly useful here because graph traversal may surface entities
+        # several hops away whose relevance to the original query varies.
+        if self.rerank_path is not None and rerank_query is None:
+            raise ValueError(
+                "rerank_query is required when rerank_path is set on the store. "
+                "Pass the query text to use for reranking."
+            )
+        if self.rerank_path is not None and rerank_query is not None:
+            pipeline.extend(
+                rerank_stage(
+                    rerank_query,
+                    self.rerank_path,
+                    self.num_docs_to_rerank,
+                    self.rerank_model,
+                )
+            )
+
         return list(self.collection.aggregate(pipeline))  # type:ignore[arg-type]
 
-    def similarity_search(self, input_document: str) -> List[Entity]:
+    def similarity_search(
+        self,
+        input_document: str,
+    ) -> List[Entity]:
         """Retrieve list of connected Entities found via traversal of KnowledgeGraph.
 
         1. Use LLM & Prompt to find entities within the input_document itself.
@@ -507,10 +557,14 @@ class MongoDBGraphStore:
         Args:
             input_document: String to find relevant documents for.
         Returns:
-            List of connected Entity dictionaries.
+            List of connected Entity dictionaries, reranked by relevance if
+            ``rerank_path`` is set on the store.
         """
         starting_ids: List[str] = self.extract_entity_names(input_document)
-        return self.related_entities(starting_ids)
+        return self.related_entities(
+            starting_ids,
+            rerank_query=input_document,
+        )
 
     def chat_response(
         self,
@@ -544,3 +598,138 @@ class MongoDBGraphStore:
                 entity_schema=entity_schema,
             )
         )
+
+    def to_networkx(
+        self,
+        nx_opts: Optional[dict] = None,
+        json_opts: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> networkx.DiGraph:
+        """Utility converts Entity Collection to `NetworkX DiGraph <https://networkx.org/documentation/stable/index.html>`_
+
+        NOTE: Requires optional-dependency "viz", i.e. `pip install "langchain-mongodb[viz]"`.
+
+        Args:
+            nx_opts: Keyword arguments for networkx calls.
+            json_opts: Keyword arguments for printing of node attributes and types.
+            **kwargs: Keyword arguments available for compatibility.
+
+        Returns: networkx.DiGraph
+        """
+
+        try:
+            import json
+
+            import networkx as nx
+        except ImportError as e:
+            raise ImportError(
+                "Install optional-dependency `viz` for networkx or to view in Holoviews"
+            ) from e
+
+        def _safe_get(lst: list, i: int, default: Any = "") -> Any:
+            return lst[i] if i < len(lst) else default
+
+        nx_opts = {} if nx_opts is None else nx_opts
+        json_opts = {} if json_opts is None else json_opts
+
+        # First pass: Add all nodes with their attributes
+        nx_graph: networkx.DiGraph = nx.DiGraph(**nx_opts)
+        for doc in self.collection.find({}, {"type": 1, "attributes": 1}):
+            # Add node with all attributes
+            node_id = doc["_id"]
+            node_attrs = {}
+            node_attrs["type"] = json.dumps(doc.get("type", ""), **json_opts)
+            node_attrs["attributes"] = json.dumps(
+                doc.get("attributes", {}), **json_opts
+            )
+            nx_graph.add_node(node_id, **node_attrs, **json_opts)
+
+        # Second pass: Add edges based on relationships
+        for doc in self.collection.find({}, {"_id": 1, "relationships": 1}):
+            source_id = doc["_id"]
+            relationships = doc.get("relationships", {})
+            # relationships can contain numerous target_ids, each with type and attributes
+            target_ids = relationships.get("target_ids", [])
+            n_targets = len(target_ids)
+            types = relationships.get("types", [])
+            attrs = relationships.get("attributes", [])
+
+            for t in range(n_targets):
+                # Add edge and attributes
+                edge_attrs = {}
+                edge_attrs["type"] = json.dumps(_safe_get(types, t), **json_opts)
+                edge_attrs["attributes"] = json.dumps(_safe_get(attrs, t), **json_opts)
+                if nx_graph.has_node(target_ids[t]):
+                    nx_graph.add_edge(source_id, target_ids[t], **edge_attrs, **nx_opts)
+                else:
+                    logger.warning(
+                        f"{source_id=} references {target_ids[t]=} not found in collection"
+                    )
+
+        return nx_graph
+
+    def view(
+        self,
+        layout: Optional[Callable] = None,
+        nx_opts: Optional[dict] = None,
+        json_opts: Optional[dict] = None,
+        edge_opts: Optional[dict] = None,
+        node_opts: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> holoviews.Graph:
+        """Draws a Knowledge Graph as Holoviews/Bokeh interactive plot.
+
+        We first convert the entity collection to a NetworkX Graph,
+        and then convert it to a Holoviews Graph via their API.
+
+        The default layout chosen is the spring_layout.
+        This maximizes the distance between nodes. As our entities have a type field,
+        however, another good layout choice might be
+        `layout=nx.multipartite_layout, nx_opts["subset_key"]= "type"`
+        as multipartite layout positions nodes in straight lines by subset key.
+
+        NOTE: Requires optional-dependency "viz", i.e. `pip install "langchain-mongodb[viz]"`.
+
+        You can save the view as any HoloViews object with `.save`.
+        The type will be inferred from the filename's suffix,
+        (e.g., hv.save(graph, "graph.html")) or by clicking the download widget
+        on the Bokeh plot from a Jupyter notebook.
+
+        Args:
+            layout: `networkx layout. <https://networkx.org/documentation/stable/reference/drawing.html#module-networkx.drawing.layout>`_
+                Defaults to networkx.spring_layout.
+            nx_opts: Keyword arguments for to_networkx function.
+            json_opts: Keyword arguments for printing of node attributes and types.
+            edge_opts: Keyword arguments to draw edges.
+            node_opts: Keyword arguments to draw nodes.
+            **kwargs: Keyword arguments available for compatibility.
+
+        Returns: `holoviews.Graph <https://holoviews.org/user_guide/Network_Graphs.html>`_
+
+        """
+        try:
+            import holoviews as hv
+            import networkx as nx
+
+            hv.extension("bokeh")
+        except ImportError as e:
+            raise ImportError("To view graph, install optional-dependency `viz`") from e
+
+        hv.opts.defaults(
+            hv.opts.Graph(xaxis=None, yaxis=None), hv.opts.Nodes(xaxis=None, yaxis=None)
+        )
+
+        if layout is None:
+            layout = nx.spring_layout
+        # Convert entity collection to NetworkX graph.
+        nx_opts = {} if nx_opts is None else nx_opts
+        json_opts = {} if json_opts is None else json_opts
+        nx_graph = self.to_networkx(**nx_opts, **json_opts)
+        # Convert to HoloViews Graph
+        hv_graph = hv.Graph.from_networkx(nx_graph, layout, **nx_opts)
+        # Display with hover tools over edges and nodes
+        edge_opts = {} if edge_opts is None else edge_opts
+        node_opts = {} if node_opts is None else node_opts
+        return hv_graph.opts(
+            inspection_policy="edges", **edge_opts
+        ) * hv_graph.nodes.opts(**node_opts)

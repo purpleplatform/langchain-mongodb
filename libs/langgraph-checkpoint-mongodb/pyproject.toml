@@ -4,24 +4,23 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langgraph-checkpoint-mongodb"
-version = "0.1.4"
+version = "0.4.0"
 description = "Library with a MongoDB implementation of LangGraph checkpoint saver."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
-    "langgraph-checkpoint>=2.0.23,<3.0.0",
-    "langchain-mongodb>=0.6.1",
-    "pymongo>=4.12,<4.15",
+    "langgraph-checkpoint>=3.0.0",
+    "langchain-mongodb>=0.11.0",
+    "pymongo>=4.12,<4.18",
 ]
 
 [dependency-groups]
 dev = [
     "anyio>=4.4.0",
-    "langchain-core>=0.3.55",
-    "langchain-ollama>=0.2.2",
-    "langchain-openai>=0.2.14",
-    "langgraph>=0.3.23",
-    "langgraph-checkpoint>=2.0.9",
+    "langchain-core>=1.2.5",
+    "langchain-ollama>=1.0.0",
+    "langchain-openai>=1.0.0",
+    "langgraph>=1.0.0",
     "pytest-asyncio>=0.21.1",
     "pytest>=7.2.1",
     "pytest-mock>=3.11.1",
@@ -52,7 +51,7 @@ lint.select = [
   "B",  # flake8-bugbear
   "I",  # isort
 ]
-lint.ignore = ["E501", "B008", "UP007", "UP006"]
+lint.ignore = ["E501", "B008", "UP007", "UP006", "UP045"]
 
 [tool.mypy]
 # https://mypy.readthedocs.io/en/stable/config_file.html
@@ -63,3 +62,17 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 allow_redefinition = true
 disable_error_code = "typeddict-item, return-value"
+
+[tool.uv.sources]
+# chunking support lives in the in-repo langchain-mongodb (first-party, not yet
+# published to PyPI), and saver.py/base.py import langchain_mongodb.chunking.
+# Consume the local editable package so standalone builds/tests resolve it.
+langchain-mongodb = { path = "../langchain-mongodb", editable = true }
+
+[tool.uv]
+# The CI "minimum dependency versions" step (uv sync --resolution=lowest-direct)
+# otherwise pins numpy==1.26.0, which ships no cp313 wheel and fails to build from
+# source on the runner. Floor numpy to the first release with cp310-cp313 wheels.
+constraint-dependencies = [
+    "numpy>=2.1.0",
+]

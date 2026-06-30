@@ -34,7 +34,9 @@ from langchain_mongodb.cache import MongoDBAtlasSemanticCache
 TIMEOUT = 120
 INTERVAL = 0.5
 CONNECTION_STRING = os.environ.get("MONGODB_URI", "")
-
+AUTOEMBED_MODEL = "voyage-4"
+AUTOEMBED_IDX_NAME = "langchain-test-index-from-texts-autoEmbed"
+AUTOEMBED_COLLECTION_NAME = "langchain_test_from_texts-autoEmbed"
 
 DB_NAME = "langchain_test_db"
 
@@ -51,7 +53,7 @@ def create_llm() -> BaseChatModel:
     if os.environ.get("AZURE_OPENAI_ENDPOINT"):
         return AzureChatOpenAI(model="o4-mini", timeout=60, cache=False, seed=12345)
     if os.environ.get("OPENAI_API_KEY"):
-        return ChatOpenAI(model="gpt-4o-mini", timeout=60, cache=False, seed=12345)
+        return ChatOpenAI(model="gpt-5-mini", timeout=60, cache=False, seed=12345)
     return ChatOllama(model="llama3:8b", cache=False, seed=12345)
 
 
@@ -66,14 +68,28 @@ class PatchedMongoDBAtlasVectorSearch(MongoDBAtlasVectorSearch):
         ids_inserted = super().bulk_embed_and_insert_texts(texts, metadatas, ids)
         n_docs = self.collection.count_documents({})
         start = monotonic()
-        while monotonic() - start <= TIMEOUT:
-            if (
-                len(self.similarity_search("sandwich", k=n_docs, oversampling_factor=1))
-                == n_docs
-            ):
-                return ids_inserted
-            else:
+
+        if self._is_autoembedding:
+            while monotonic() - start <= TIMEOUT:
+                for idx in list(self.collection.list_search_indexes()):
+                    if idx["name"] == self._index_name:
+                        if idx["numDocs"] == n_docs:
+                            return ids_inserted
                 sleep(INTERVAL)
+        else:
+            while monotonic() - start <= TIMEOUT:
+                if (
+                    len(
+                        self.similarity_search(
+                            "sandwich", k=n_docs, oversampling_factor=1
+                        )
+                    )
+                    == n_docs
+                ):
+                    return ids_inserted
+                else:
+                    sleep(INTERVAL)
+
         raise TimeoutError(f"Failed to embed, insert, and index texts in {TIMEOUT}s.")
 
     def _similarity_search_with_score(self, query_vector, **kwargs):
@@ -238,7 +254,10 @@ class MockDatabase:
     def __init__(self, client=None):
         self.client = client or MockClient()
 
-    def list_collection_names(self) -> list[str]:
+    def create_collection(self, name: str) -> None:
+        pass
+
+    def list_collection_names(self, authorizedCollections: bool = True) -> list[str]:
         return ["test"]
 
     def __getitem__(self, key: str) -> Any:

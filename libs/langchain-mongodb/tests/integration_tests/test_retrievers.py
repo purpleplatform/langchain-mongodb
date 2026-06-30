@@ -1,3 +1,4 @@
+import os
 from time import sleep, time
 from typing import Generator, List
 
@@ -7,8 +8,10 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from pymongo import MongoClient
 from pymongo.collection import Collection
+from pymongo_search_utils import drop_vector_search_index
 
 from langchain_mongodb import MongoDBAtlasVectorSearch
+from langchain_mongodb.embeddings import AutoEmbeddings
 from langchain_mongodb.index import (
     create_fulltext_search_index,
     create_vector_search_index,
@@ -18,16 +21,27 @@ from langchain_mongodb.retrievers import (
     MongoDBAtlasHybridSearchRetriever,
 )
 
-from ..utils import DB_NAME, PatchedMongoDBAtlasVectorSearch
+from ..utils import (
+    AUTOEMBED_IDX_NAME,
+    AUTOEMBED_MODEL,
+    DB_NAME,
+    ConsistentFakeEmbeddings,
+    MockCollection,
+    PatchedMongoDBAtlasVectorSearch,
+)
 
 COLLECTION_NAME = "langchain_test_retrievers"
 COLLECTION_NAME_NESTED = "langchain_test_retrievers_nested"
+COLLECTION_NAME_AUTOEMBED = "langchain_test_retrievers_autoembed"
+COLLECTION_NAME_HYBRID_AUTOCREATE = "langchain_test_retrievers_hybrid_autocreate"
+COLLECTION_NAME_FULLTEXT_AUTOCREATE = "langchain_test_retrievers_fulltext_autocreate"
 VECTOR_INDEX_NAME = "vector_index"
 EMBEDDING_FIELD = "embedding"
 PAGE_CONTENT_FIELD = "text"
 PAGE_CONTENT_FIELD_NESTED = "title.text"
 SEARCH_INDEX_NAME = "text_index"
 SEARCH_INDEX_NAME_NESTED = "text_index_nested"
+INDEX_NAME = "langchain-test-index"
 
 TIMEOUT = 60.0
 INTERVAL = 0.5
@@ -41,6 +55,20 @@ def example_documents() -> List[Document]:
         Document(page_content="In 2021, I visited New Orleans"),
         Document(page_content="Sandwiches are beautiful. Sandwiches are fine."),
     ]
+
+
+@pytest.fixture(scope="module")
+def embedding_openai() -> Embeddings:
+    return ConsistentFakeEmbeddings()
+
+
+def get_collection() -> MockCollection:
+    return MockCollection()
+
+
+@pytest.fixture()
+def mocked_collection() -> MockCollection:
+    return get_collection()
 
 
 @pytest.fixture(scope="module")
@@ -108,6 +136,37 @@ def collection_nested(client: MongoClient, dimensions: int) -> Collection:
 
 
 @pytest.fixture(scope="module")
+def collection_autoembed(client: MongoClient) -> Collection:
+    if COLLECTION_NAME_AUTOEMBED not in client[DB_NAME].list_collection_names():
+        clxn = client[DB_NAME].create_collection(COLLECTION_NAME_AUTOEMBED)
+    else:
+        clxn = client[DB_NAME][COLLECTION_NAME_AUTOEMBED]
+
+    clxn.delete_many({})
+
+    if not any([VECTOR_INDEX_NAME == ix["name"] for ix in clxn.list_search_indexes()]):
+        create_vector_search_index(
+            collection=clxn,
+            index_name=VECTOR_INDEX_NAME,
+            dimensions=-1,
+            path="text",
+            similarity=None,
+            wait_until_complete=TIMEOUT,
+            auto_embedding_model=AUTOEMBED_MODEL,
+        )
+
+    if not any([SEARCH_INDEX_NAME == ix["name"] for ix in clxn.list_search_indexes()]):
+        create_fulltext_search_index(
+            collection=clxn,
+            index_name=SEARCH_INDEX_NAME,
+            field=PAGE_CONTENT_FIELD,
+            wait_until_complete=TIMEOUT,
+        )
+
+    return clxn
+
+
+@pytest.fixture(scope="module")
 def indexed_vectorstore(
     collection: Collection,
     example_documents: List[Document],
@@ -120,6 +179,30 @@ def indexed_vectorstore(
         embedding=embedding,
         index_name=VECTOR_INDEX_NAME,
         text_key=PAGE_CONTENT_FIELD,
+    )
+
+    vectorstore.add_documents(example_documents)
+
+    yield vectorstore
+
+    vectorstore.collection.delete_many({})
+
+
+@pytest.fixture(scope="module")
+def indexed_vectorstore_autoembed(
+    collection_autoembed: Collection,
+    example_documents: List[Document],
+) -> Generator[MongoDBAtlasVectorSearch, None, None]:
+    """Return a VectorStore with example document embeddings indexed."""
+
+    vectorstore = PatchedMongoDBAtlasVectorSearch(
+        collection=collection_autoembed,
+        embedding=AutoEmbeddings(AUTOEMBED_MODEL),
+        index_name=AUTOEMBED_IDX_NAME,
+        text_key=PAGE_CONTENT_FIELD,
+        embedding_key=None,
+        relevance_score_fn=None,
+        dimensions=-1,
     )
 
     vectorstore.add_documents(example_documents)
@@ -183,6 +266,30 @@ def test_hybrid_retriever(indexed_vectorstore: PatchedMongoDBAtlasVectorSearch) 
     assert "New Orleans" in results[0].page_content
 
 
+@pytest.mark.skipif(
+    os.environ.get("COMMUNITY_WITH_SEARCH", "") == "",
+    reason="Auto-embedding requires COMMUNITY_WITH_SEARCH environment variable",
+)
+def test_hybrid_retriever_autoembed(
+    indexed_vectorstore_autoembed: PatchedMongoDBAtlasVectorSearch,
+) -> None:
+    """Test basic usage of MongoDBAtlasHybridSearchRetriever"""
+    retriever = MongoDBAtlasHybridSearchRetriever(
+        vectorstore=indexed_vectorstore_autoembed,
+        search_index_name=SEARCH_INDEX_NAME,
+        k=3,
+    )
+
+    query1 = "When did I visit France?"
+    results = retriever.invoke(query1)
+    assert len(results) == 3
+    assert "Paris" in results[0].page_content
+
+    query2 = "When was the last time I visited new orleans?"
+    results = retriever.invoke(query2)
+    assert "New Orleans" in results[0].page_content
+
+
 def test_hybrid_retriever_deprecated_top_k(
     indexed_vectorstore: PatchedMongoDBAtlasVectorSearch,
 ) -> None:
@@ -194,12 +301,14 @@ def test_hybrid_retriever_deprecated_top_k(
     )
 
     query1 = "When did I visit France?"
-    results = retriever.invoke(query1)
+    with pytest.warns(DeprecationWarning):
+        results = retriever.invoke(query1)
     assert len(results) == 3
     assert "Paris" in results[0].page_content
 
     query2 = "When was the last time I visited new orleans?"
-    results = retriever.invoke(query2)
+    with pytest.warns(DeprecationWarning):
+        results = retriever.invoke(query2)
     assert "New Orleans" in results[0].page_content
 
 
@@ -313,3 +422,67 @@ def test_fulltext_retriever(
     results = retriever.invoke(query)
     assert "New Orleans" in results[0].page_content
     assert "score" in results[0].metadata
+
+
+def test_fulltext_retriever_auto_create_index(
+    client: MongoClient,
+) -> None:
+    clxn = client[DB_NAME][COLLECTION_NAME_FULLTEXT_AUTOCREATE]
+    clxn.delete_many({})
+
+    if any(ix["name"] == SEARCH_INDEX_NAME for ix in clxn.list_search_indexes()):
+        drop_vector_search_index(clxn, SEARCH_INDEX_NAME, wait_until_complete=TIMEOUT)
+
+    index_names_before = [ix["name"] for ix in clxn.list_search_indexes()]
+    assert SEARCH_INDEX_NAME not in index_names_before
+
+    _ = MongoDBAtlasFullTextSearchRetriever(
+        collection=clxn,
+        search_index_name=SEARCH_INDEX_NAME,
+        search_field=PAGE_CONTENT_FIELD,
+        auto_create_index=True,
+        auto_index_timeout=TIMEOUT,  # type: ignore[arg-type]
+    )
+    index_names_after = [ix["name"] for ix in clxn.list_search_indexes()]
+    assert SEARCH_INDEX_NAME in index_names_after
+
+
+def test_hybrid_retriever_auto_create_index(
+    client: MongoClient,
+    dimensions: int,
+    embedding: Embeddings,
+) -> None:
+    clxn = client[DB_NAME][COLLECTION_NAME_HYBRID_AUTOCREATE]
+    clxn.delete_many({})
+
+    if any(ix["name"] == SEARCH_INDEX_NAME for ix in clxn.list_search_indexes()):
+        drop_vector_search_index(clxn, SEARCH_INDEX_NAME, wait_until_complete=TIMEOUT)
+
+    # Vector index only (no full-text index yet)
+    if not any([VECTOR_INDEX_NAME == ix["name"] for ix in clxn.list_search_indexes()]):
+        create_vector_search_index(
+            collection=clxn,
+            index_name=VECTOR_INDEX_NAME,
+            dimensions=dimensions,
+            path=EMBEDDING_FIELD,
+            similarity="cosine",
+            wait_until_complete=TIMEOUT,
+        )
+    index_names_before = [ix["name"] for ix in clxn.list_search_indexes()]
+    assert SEARCH_INDEX_NAME not in index_names_before
+
+    vectorstore = MongoDBAtlasVectorSearch(
+        collection=clxn,
+        embedding=embedding,
+        index_name=VECTOR_INDEX_NAME,
+        text_key=PAGE_CONTENT_FIELD,
+        auto_create_index=False,
+    )
+    _ = MongoDBAtlasHybridSearchRetriever(
+        vectorstore=vectorstore,
+        search_index_name=SEARCH_INDEX_NAME,
+        auto_create_index=True,
+        auto_index_timeout=TIMEOUT,  # type: ignore[arg-type]
+    )
+    index_names_after = [ix["name"] for ix in clxn.list_search_indexes()]
+    assert SEARCH_INDEX_NAME in index_names_after
