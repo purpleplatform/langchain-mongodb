@@ -98,9 +98,31 @@ lint.ignore = ["E501", "B008", "UP007", "UP006", "UP035", "UP045"]
 omit = ["tests/*"]
 
 [tool.uv]
-# The CI "minimum dependency versions" step (uv sync --resolution=lowest-direct)
-# otherwise pins numpy==1.26.0, which ships no cp313 wheel and fails to build from
-# source on the runner. Floor numpy to the first release with cp310-cp313 wheels.
+# Vanta vulnerability remediation: security floors for transitive deps.
+# requires-python is >=3.10, so the py3.10-gated upstream fixes are taken
+# (aiohttp 3.14.x, urllib3 2.7.0, langsmith 0.6+, requests 2.33+, filelock 3.20+,
+# idna 3.18, langchain 1.3.9 path-traversal fix, orjson, python-dotenv, pip 26).
+# Most are already satisfied by current upstream; these floors keep them pinned
+# at or above the patched versions even under --resolution=lowest-direct.
 constraint-dependencies = [
+    # numpy 1.26.0 has no cp313 wheel and fails to build from source under
+    # --resolution=lowest-direct; 2.1.0 is the first with cp310-cp313 wheels.
     "numpy>=2.1.0",
+    # mypy 2.x pulls ast-serialize, whose 0.6.0 only ships a cp314 wheel (no
+    # sdist), so it can't install on 3.10-3.13. Pin below it; 0.1.x-0.2.x ship
+    # cp39-abi3 wheels covering all supported versions. Needed for the CI
+    # "minimum dependency versions" (--resolution=lowest-direct) step.
+    "ast-serialize<0.6.0",
+    "aiohttp>=3.14.1",
+    "filelock>=3.20.0",
+    "idna>=3.18",
+    "langsmith>=0.6.0",
+    "marshmallow>=3.26.2",
+    "orjson>=3.11.6",
+    "pip>=26.1",
+    "pygments>=2.20.0",
+    "pypdf>=6.13.3",
+    "python-dotenv>=1.2.2",
+    "requests>=2.33.0",
+    "urllib3>=2.7.0",
 ]
