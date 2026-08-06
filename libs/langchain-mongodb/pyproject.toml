@@ -68,7 +68,9 @@ lint.select = [
   "B",  # flake8-bugbear
   "I",  # isort
 ]
-lint.ignore = ["E501", "B008", "UP007", "UP006", "UP035"]
+# UP038 (isinstance tuple -> X | Y) was later removed from ruff: the union form is
+# slower at runtime. Only surfaces here because requires-python is now >=3.10.
+lint.ignore = ["E501", "B008", "UP007", "UP006", "UP035", "UP038"]
 
 [tool.coverage.run]
 omit = ["tests/*"]
