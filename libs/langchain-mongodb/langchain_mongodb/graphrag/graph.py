@@ -21,10 +21,7 @@ from .prompts import rag_prompt
 from .schema import entity_schema
 
 if TYPE_CHECKING:
-    try:
-        from typing import TypeAlias  # type:ignore[attr-defined]  # Python 3.10+
-    except ImportError:
-        from typing_extensions import TypeAlias  # Python 3.9 fallback
+    from typing import TypeAlias
 
     Entity: TypeAlias = Dict[str, Any]
     """Represents an Entity in the knowledge graph with specific schema. See .schema"""
