@@ -315,9 +315,7 @@ class MongoDBStore(BaseStore):
                 return None
 
             chunk_keys = [f"{chunk_key}_part_{i + 1}" for i in range(num_chunks)]
-            chunk_docs_cursor = self.chunk_collection.find(
-                {"_id": {"$in": chunk_keys}}
-            )
+            chunk_docs_cursor = self.chunk_collection.find({"_id": {"$in": chunk_keys}})
             docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
 
             if len(docs_by_id) != num_chunks:

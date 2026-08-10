@@ -263,9 +263,7 @@ class MongoDBSaver(BaseCheckpointSaver):
                     chunk_docs_cursor = self.chunk_collection.find(
                         {"_id": {"$in": chunk_keys}}
                     )
-                    docs_by_id = {
-                        doc["_id"]: doc["value"] for doc in chunk_docs_cursor
-                    }
+                    docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
 
                     if len(docs_by_id) != num_chunks:
                         continue  # or log warning
@@ -384,9 +382,7 @@ class MongoDBSaver(BaseCheckpointSaver):
                     chunk_docs_cursor = self.chunk_collection.find(
                         {"_id": {"$in": chunk_keys}}
                     )
-                    docs_by_id = {
-                        doc["_id"]: doc["value"] for doc in chunk_docs_cursor
-                    }
+                    docs_by_id = {doc["_id"]: doc["value"] for doc in chunk_docs_cursor}
 
                     if len(docs_by_id) != num_chunks:
                         continue

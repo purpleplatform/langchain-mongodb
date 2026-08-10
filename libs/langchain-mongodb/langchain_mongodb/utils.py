@@ -187,9 +187,9 @@ def make_serializable(
     for k, v in obj.items():
         if isinstance(v, dict):
             make_serializable(v)
-        elif isinstance(v, list) and v and isinstance(v[0], (ObjectId, date, datetime)):
+        elif isinstance(v, list) and v and isinstance(v[0], (ObjectId, date, datetime)):  # noqa: UP038
             obj[k] = [oid_to_str(item) for item in v]
         elif isinstance(v, ObjectId):
             obj[k] = oid_to_str(v)
-        elif isinstance(v, (datetime, date)):
+        elif isinstance(v, (datetime, date)):  # noqa: UP038
             obj[k] = v.isoformat()
