@@ -36,7 +36,8 @@ dev = [
     "langchain-ollama>=0.2.2",
     "langchain-openai>=0.2.14",
     "langchain-community>=0.3.27",
-    "pypdf>=5.0.1",
+    # Floor covers GHSA-fp3f-mc75-235c + GHSA-fwg2-594c-jp42 (both fixed in 6.15.0).
+    "pypdf>=6.15.0",
     "langgraph>=0.2.72",
     "flaky>=3.8.1",
     "langchain-tests==0.3.20",
