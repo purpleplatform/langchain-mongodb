@@ -856,9 +856,9 @@ dev = [
     { name = "langgraph", specifier = ">=0.2.72" },
     { name = "mongomock", specifier = ">=4.2.0.post1" },
     { name = "mypy", specifier = ">=1.10" },
-    { name = "pip", specifier = ">=25.0.1" },
+    { name = "pip", specifier = ">=26.2.0" },
     { name = "pre-commit", specifier = ">=4.0" },
-    { name = "pypdf", specifier = ">=5.0.1" },
+    { name = "pypdf", specifier = ">=6.16.1" },
     { name = "pytest", specifier = ">=7.3.0" },
     { name = "pytest-asyncio", specifier = ">=0.21.1" },
     { name = "pytest-mock", specifier = ">=3.10.0" },
@@ -940,7 +940,7 @@ wheels = [
 
 [[package]]
 name = "langgraph-checkpoint-mongodb"
-version = "0.1.4"
+version = "0.3.0"
 source = { editable = "libs/langgraph-checkpoint-mongodb" }
 dependencies = [
     { name = "langchain-mongodb" },
@@ -975,7 +975,7 @@ dev = [
 
 [[package]]
 name = "langgraph-store-mongodb"
-version = "0.0.1"
+version = "0.4.0"
 source = { editable = "libs/langgraph-store-mongodb" }
 dependencies = [
     { name = "langchain-mongodb" },
