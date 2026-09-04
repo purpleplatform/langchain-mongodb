@@ -21,7 +21,7 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
 )
 
-from .utils import DRIVER_METADATA, dumps_metadata, loads_metadata
+from .utils import DRIVER_METADATA, _validate_filter, dumps_metadata, loads_metadata
 
 
 class MongoDBSaver(BaseCheckpointSaver):
@@ -329,6 +329,7 @@ class MongoDBSaver(BaseCheckpointSaver):
                 query["checkpoint_ns"] = config["configurable"]["checkpoint_ns"]
 
         if filter:
+            _validate_filter(filter)
             for key, value in filter.items():
                 query[f"metadata.{key}"] = dumps_metadata(value)
 

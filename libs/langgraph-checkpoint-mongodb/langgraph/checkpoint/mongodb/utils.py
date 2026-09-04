@@ -38,6 +38,16 @@ def loads_metadata(metadata: dict[str, Any]) -> CheckpointMetadata:
         return serde.loads(metadata)
 
 
+def _validate_filter(filter_dict: dict[str, Any]) -> None:
+    for key, value in filter_dict.items():
+        if not isinstance(key, str) or key.startswith("$"):
+            raise ValueError(
+                f"Invalid filter key '{key}': MongoDB operator keys are not allowed."
+            )
+        if isinstance(value, dict):
+            _validate_filter(value)
+
+
 def dumps_metadata(
     metadata: Union[CheckpointMetadata, Any],
 ) -> Union[bytes, dict[str, Any]]:
